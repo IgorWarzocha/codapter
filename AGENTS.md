@@ -15,6 +15,7 @@ This file is a lightweight, internal onboarding note for agents working in this 
 - Formatting and linting via Biome (`biome.json`); pre-commit hook runs `lint-staged`.
 - Keep edits ASCII-only unless a file already uses Unicode.
 - Prefer small, focused changes; match existing file layout and naming.
+- Keep changed LoC to an absolute minimum so patches stay easy to review and merge upstream.
 
 ## Testing Requirements
 
