@@ -497,7 +497,6 @@ export class PiBackend implements IBackend {
   private readonly idleTimeoutMs: number;
   private readonly stateStore: PiBackendStateStore;
   private readonly sessions = new Map<string, ManagedSession>();
-  private readonly sessionCwds = new Map<string, string>();
   private readonly idleTimers = new Map<string, ReturnType<typeof setTimeout>>();
   private readonly modelCache = new Map<string, BackendModelSummary>();
   private modelListPromise: Promise<BackendModelSummary[]> | null = null;
@@ -591,7 +590,8 @@ export class PiBackend implements IBackend {
   }
 
   async threadStart(input: BackendThreadStartInput): Promise<BackendThreadStartResult> {
-    const threadHandle = await this.createSession(input.cwd, input.launchConfig);
+    const launchConfig = { ...input.launchConfig, cwd: input.cwd };
+    const threadHandle = await this.createSession(launchConfig);
     if (input.model) {
       await this.setModel(threadHandle, input.model);
     }
@@ -605,11 +605,8 @@ export class PiBackend implements IBackend {
   }
 
   async threadResume(input: BackendThreadResumeInput): Promise<BackendThreadResumeResult> {
-    const threadHandle = await this.resumeSession(
-      input.threadHandle,
-      input.cwd,
-      input.launchConfig
-    );
+    const launchConfig = { ...input.launchConfig, cwd: input.cwd };
+    const threadHandle = await this.resumeSession(input.threadHandle, launchConfig);
     if (input.model) {
       await this.setModel(threadHandle, input.model);
     }
@@ -623,11 +620,8 @@ export class PiBackend implements IBackend {
   }
 
   async threadFork(input: BackendThreadForkInput): Promise<BackendThreadForkResult> {
-    const threadHandle = await this.forkSession(
-      input.sourceThreadHandle,
-      input.cwd,
-      input.launchConfig
-    );
+    const launchConfig = { ...input.launchConfig, cwd: input.cwd };
+    const threadHandle = await this.forkSession(input.sourceThreadHandle, launchConfig);
     if (input.model) {
       await this.setModel(threadHandle, input.model);
     }
@@ -729,11 +723,10 @@ export class PiBackend implements IBackend {
     );
   }
 
-  async createSession(cwd: string, config?: BackendSessionLaunchConfig): Promise<string> {
+  async createSession(config?: BackendSessionLaunchConfig): Promise<string> {
     this.assertReady();
     const sessionId = opaqueSessionId();
-    this.sessionCwds.set(sessionId, cwd);
-    const process = this.createProcess(sessionId, config, cwd);
+    const process = this.createProcess(sessionId, config);
     const snapshot = await process.startFresh();
     const record = await this.persistSnapshot(sessionId, snapshot);
     const session = { process, record };
@@ -746,13 +739,8 @@ export class PiBackend implements IBackend {
     return sessionId;
   }
 
-  async resumeSession(
-    sessionId: string,
-    cwd: string,
-    config?: BackendSessionLaunchConfig
-  ): Promise<string> {
+  async resumeSession(sessionId: string, config?: BackendSessionLaunchConfig): Promise<string> {
     this.assertReady();
-    this.sessionCwds.set(sessionId, cwd);
     if (config) {
       this.launchConfigs.set(sessionId, config);
     }
@@ -761,11 +749,7 @@ export class PiBackend implements IBackend {
     return sessionId;
   }
 
-  async forkSession(
-    sessionId: string,
-    cwd: string,
-    config?: BackendSessionLaunchConfig
-  ): Promise<string> {
+  async forkSession(sessionId: string, config?: BackendSessionLaunchConfig): Promise<string> {
     this.assertReady();
     const source = await this.ensureActiveSession(sessionId);
     if (!source.record.sessionFile) {
@@ -773,8 +757,7 @@ export class PiBackend implements IBackend {
     }
 
     const forkedSessionId = opaqueSessionId();
-    this.sessionCwds.set(forkedSessionId, cwd);
-    const process = this.createProcess(forkedSessionId, config, cwd);
+    const process = this.createProcess(forkedSessionId, config);
     await process.attachSession(source.record.sessionFile);
 
     const anchors = await process.getForkMessages();
@@ -810,7 +793,6 @@ export class PiBackend implements IBackend {
       this.sessions.delete(sessionId);
     }
     this.launchConfigs.delete(sessionId);
-    this.sessionCwds.delete(sessionId);
     const runtime = this.threadRuntimes.get(sessionId);
     runtime?.processSubscription?.dispose();
     this.threadRuntimes.delete(sessionId);
@@ -985,16 +967,14 @@ export class PiBackend implements IBackend {
 
   private createProcess(
     sessionId: string,
-    launchConfig?: BackendSessionLaunchConfig,
-    cwd?: string
+    launchConfig?: BackendSessionLaunchConfig
   ): PiProcessSession {
     const effectiveLaunchConfig = launchConfig ?? this.launchConfigs.get(sessionId);
-    const effectiveCwd = cwd ?? this.sessionCwds.get(sessionId);
     const options: PiProcessLaunchOptions = {
       sessionDir: this.sessionDir,
       opaqueSessionId: sessionId,
       ...this.launchOptions,
-      ...(effectiveCwd ? { cwd: effectiveCwd } : {}),
+      ...(effectiveLaunchConfig?.cwd ? { cwd: effectiveLaunchConfig.cwd } : {}),
       ...(this.collabExtensionPath !== null
         ? { collabExtensionPath: this.collabExtensionPath }
         : {}),
