@@ -37,6 +37,20 @@ This file is a lightweight, internal onboarding note for agents working in this 
 - Compare `/tmp/codapter-stdio.log` against `/tmp/codapter-codex-stdio.log` first when native Codex and Pi diverge. Use `/tmp/codapter.jsonl` for app-server level debug events from Codapter.
 - Stop the GUI between backend switches so the next run binds cleanly to the remote debugging port and starts with fresh logs.
 
+## Local `Codex - Pi` Setup Notes
+
+- The local desktop launcher is `/home/igorw/.local/bin/codex-desktop-pi`.
+- That launcher is intentionally Pi-only for this machine:
+  - `CODAPTER_CODEX_DISABLE=1`
+  - `CODAPTER_PI_MODEL_ALLOWLIST="openai-codex/*,zai/glm-*"`
+- Debug logging is intentionally disabled by default in that launcher so it does not leave a persistent `/tmp` log behind.
+- Enable debug logging only when needed, for example:
+  ```bash
+  CODAPTER_DEBUG_LOG_FILE=/tmp/codapter-pi.jsonl /home/igorw/.local/bin/codex-desktop-pi
+  ```
+- Pi auth currently comes from `~/.pi/agent/auth.json`. The local setup was trimmed to keep `openai-codex` and `zai`; `opencode` was removed to avoid extra model families in the picker.
+- Codapter was locally patched so the Pi backend honors `CODAPTER_PI_MODEL_ALLOWLIST` during `model/list`, while still exposing stored ChatGPT auth state to keep the Codex Desktop model picker enabled even with the native Codex backend disabled.
+
 ## Changelog
 
 Location: `CHANGELOG.md` (root)

@@ -210,6 +210,7 @@ export async function runCli(
       const piBackend = createPiBackend({
         ...(piCommand ? { command: piCommand } : {}),
         ...(piArgs ? { args: piArgs } : {}),
+        env,
         ...(piIdleTimeoutMs !== undefined ? { idleTimeoutMs: piIdleTimeoutMs } : {}),
         ...(parsed.collabEnabled ? { collabExtensionPath: resolveCollabExtensionPath(env) } : {}),
         ...(piStaticModelsPath ? { staticAvailableModelsPath: piStaticModelsPath } : {}),
@@ -251,7 +252,7 @@ export async function runCli(
     }
 
     const backendRouter = new BackendRouter(backends);
-    const initialAuthState = backendRouter.getBackend("codex") ? readStoredAuthState() : null;
+    const initialAuthState = readStoredAuthState();
 
     const signalCodes: Record<string, number> = { SIGINT: 130, SIGTERM: 143 };
     const cleanup = async (signal: string) => {
