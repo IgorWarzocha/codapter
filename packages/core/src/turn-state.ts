@@ -1,5 +1,6 @@
 import { randomUUID } from "node:crypto";
 import type { BackendEvent, BackendTokenUsage } from "./backend.js";
+import { inferCommandActions } from "./command-actions.js";
 import type { JsonValue, ThreadItem, ThreadTokenUsage, Turn, TurnError } from "./protocol.js";
 import { classifyToolName, synthesizeFileChanges } from "./tool-items.js";
 
@@ -48,6 +49,12 @@ function inferCommand(input: unknown): string {
   }
   if (typeof record.command === "string") {
     return record.command;
+  }
+  if (Array.isArray(record.cmd)) {
+    return record.cmd.filter((value): value is string => typeof value === "string").join(" ");
+  }
+  if (typeof record.cmd === "string") {
+    return record.cmd;
   }
   return "";
 }
@@ -222,16 +229,18 @@ export class TurnStateMachine {
 
     const id = randomUUID();
     const kind = classifyToolName(toolName);
+    const command = inferCommand(input);
+    const displayCommand = command || toolName;
     const item: ThreadItem =
       kind === "commandExecution"
         ? {
             type: "commandExecution",
             id,
-            command: inferCommand(input),
+            command: displayCommand,
             cwd: this.cwd,
             processId: null,
             status: "inProgress",
-            commandActions: [],
+            commandActions: inferCommandActions(displayCommand, this.cwd),
             aggregatedOutput: null,
             exitCode: null,
             durationMs: null,

@@ -108,6 +108,65 @@ describe("TurnStateMachine", () => {
           item: expect.objectContaining({
             type: "commandExecution",
             aggregatedOutput: null,
+            commandActions: [{ type: "unknown", command: "echo hi" }],
+          }),
+        }),
+      })
+    );
+  });
+
+  it("derives command actions from exec_command cmd inputs", async () => {
+    const { machine, notifications } = createMachine();
+
+    await machine.handleEvent({
+      type: "tool_start",
+      sessionId: "session-1",
+      turnId: "turn-1",
+      toolCallId: "tool-1",
+      toolName: "exec_command",
+      input: { cmd: "sed -n '1,120p' manifest.json" },
+    });
+
+    expect(notifications).toContainEqual(
+      expect.objectContaining({
+        method: "item/started",
+        params: expect.objectContaining({
+          item: expect.objectContaining({
+            type: "commandExecution",
+            command: "sed -n '1,120p' manifest.json",
+            commandActions: [
+              expect.objectContaining({
+                type: "read",
+                name: "manifest.json",
+                path: "/repo/manifest.json",
+              }),
+            ],
+          }),
+        }),
+      })
+    );
+  });
+
+  it("treats exploration-style custom tool names as command executions", async () => {
+    const { machine, notifications } = createMachine();
+
+    await machine.handleEvent({
+      type: "tool_start",
+      sessionId: "session-1",
+      turnId: "turn-1",
+      toolCallId: "tool-1",
+      toolName: "explore_repo",
+      input: {},
+    });
+
+    expect(notifications).toContainEqual(
+      expect.objectContaining({
+        method: "item/started",
+        params: expect.objectContaining({
+          item: expect.objectContaining({
+            type: "commandExecution",
+            command: "explore_repo",
+            commandActions: [{ type: "unknown", command: "explore_repo" }],
           }),
         }),
       })

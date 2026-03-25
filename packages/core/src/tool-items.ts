@@ -4,6 +4,15 @@ import type { JsonValue } from "./protocol.js";
 export type ToolItemKind = "commandExecution" | "fileChange" | "agentMessage";
 
 const COMMAND_TOOL_NAMES = new Set(["bash", "command", "exec", "exec_command", "shell"]);
+const EXPLORATION_TOOL_TOKENS = new Set([
+  "explore",
+  "find",
+  "grep",
+  "list",
+  "ls",
+  "read",
+  "search",
+]);
 const FILE_CHANGE_TOOL_NAMES = new Set([
   "apply_patch",
   "edit",
@@ -168,6 +177,9 @@ export function classifyToolName(toolName: string): ToolItemKind {
 
   const tokens = tokenizeToolName(normalized);
   if (tokens.includes("bash") || tokens.includes("shell") || tokens.includes("exec")) {
+    return "commandExecution";
+  }
+  if (tokens.some((token) => EXPLORATION_TOOL_TOKENS.has(token))) {
     return "commandExecution";
   }
   if (
