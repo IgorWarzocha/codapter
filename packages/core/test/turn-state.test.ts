@@ -165,11 +165,77 @@ describe("TurnStateMachine", () => {
         params: expect.objectContaining({
           item: expect.objectContaining({
             type: "commandExecution",
-            command: "explore_repo",
-            commandActions: [{ type: "unknown", command: "explore_repo" }],
+            command: "Explore workspace",
+            commandActions: [{ type: "list", command: "explore_repo" }],
           }),
         }),
       })
+    );
+  });
+
+  it("strips unified exec wrapper text from command output and keeps structured metadata", async () => {
+    const { machine } = createMachine();
+
+    await machine.handleEvent({
+      type: "tool_start",
+      sessionId: "session-1",
+      turnId: "turn-1",
+      toolCallId: "tool-1",
+      toolName: "exec_command",
+      input: { cmd: "date" },
+    });
+
+    await machine.handleEvent({
+      type: "tool_update",
+      sessionId: "session-1",
+      turnId: "turn-1",
+      toolCallId: "tool-1",
+      toolName: "exec_command",
+      output: {
+        content: [
+          {
+            type: "text",
+            text: "Command: date\nChunk ID: abc123\nWall time: 0.0100 seconds\nProcess running with session ID 22\nOriginal token count: 3\nOutput:\nMon Mar 23 21:22:00 CDT 2026\n",
+          },
+        ],
+      },
+      isCumulative: true,
+    });
+
+    await machine.handleEvent({
+      type: "tool_end",
+      sessionId: "session-1",
+      turnId: "turn-1",
+      toolCallId: "tool-1",
+      toolName: "exec_command",
+      output: {
+        details: {
+          output: "Mon Mar 23 21:22:00 CDT 2026\n",
+          exit_code: 0,
+          session_id: 22,
+          chunk_id: "abc123",
+          wall_time_seconds: 0.01,
+        },
+        content: [
+          {
+            type: "text",
+            text: "Command: date\nChunk ID: abc123\nWall time: 0.0100 seconds\nProcess exited with code 0\nOriginal token count: 3\nOutput:\nMon Mar 23 21:22:00 CDT 2026\n",
+          },
+        ],
+      },
+      isError: false,
+    });
+
+    expect(machine.snapshot.items).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          type: "commandExecution",
+          command: "date",
+          aggregatedOutput: "Mon Mar 23 21:22:00 CDT 2026\n",
+          processId: "22",
+          exitCode: 0,
+        }),
+      ])
     );
   });
 

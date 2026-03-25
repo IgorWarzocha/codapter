@@ -260,6 +260,13 @@ function inferToolCommand(input: unknown): string {
     if (Array.isArray(command)) {
       return command.filter((entry): entry is string => typeof entry === "string").join(" ");
     }
+    const cmd = input.cmd;
+    if (typeof cmd === "string") {
+      return cmd;
+    }
+    if (Array.isArray(cmd)) {
+      return cmd.filter((entry): entry is string => typeof entry === "string").join(" ");
+    }
   }
   return textFromUnknown(input);
 }
@@ -276,7 +283,76 @@ function toolCallCommandFromHistory(block: Record<string, unknown>): string {
   return `${fallbackName} ${command}`;
 }
 
-function mapHistoryToTurns(history: readonly BackendMessage[]) {
+function tokenizeToolName(toolName: string): string[] {
+  return toolName
+    .toLowerCase()
+    .split(/[^a-z0-9]+/u)
+    .filter((token) => token.length > 0);
+}
+
+function inferHistoryCommandPresentation(
+  toolName: string,
+  input: unknown,
+  cwd: string
+): { command: string; commandActions: Array<Record<string, unknown>> } {
+  const explicitCommand = inferToolCommand(input).trim();
+  if (explicitCommand.length > 0) {
+    return {
+      command: explicitCommand,
+      commandActions: [],
+    };
+  }
+
+  const tokens = tokenizeToolName(toolName);
+  if (tokens.includes("read")) {
+    return {
+      command: "Read workspace",
+      commandActions: [{ type: "read", command: toolName, name: "workspace", path: cwd }],
+    };
+  }
+  if (tokens.includes("search") || tokens.includes("find") || tokens.includes("grep")) {
+    return {
+      command: "Search workspace",
+      commandActions: [{ type: "search", command: toolName }],
+    };
+  }
+  if (tokens.includes("explore") || tokens.includes("list") || tokens.includes("ls")) {
+    return {
+      command: tokens.includes("explore") ? "Explore workspace" : "List workspace",
+      commandActions: [{ type: "list", command: toolName }],
+    };
+  }
+
+  return {
+    command: toolName,
+    commandActions: [{ type: "unknown", command: toolName }],
+  };
+}
+
+function parseFormattedExecTranscript(
+  text: string
+): { output: string; processId: string | null; exitCode: number | null } | null {
+  const marker = "\nOutput:\n";
+  const markerIndex = text.indexOf(marker);
+  if (
+    markerIndex === -1 ||
+    !/(^|\n)(Command: |Chunk ID: |Wall time: |Process exited with code |Process running with session ID )/u.test(
+      text
+    )
+  ) {
+    return null;
+  }
+
+  const sessionMatch = text.match(/Process running with session ID (-?\d+)/u);
+  const exitCodeMatch = text.match(/Process exited with code (-?\d+)/u);
+  return {
+    output: text.slice(markerIndex + marker.length),
+    processId: sessionMatch?.[1] ?? null,
+    exitCode: exitCodeMatch ? Number(exitCodeMatch[1]) : null,
+  };
+}
+
+function mapHistoryToTurns(history: readonly BackendMessage[], cwd: string) {
   const turns: Array<{
     id: string;
     items: Array<Record<string, unknown>>;
@@ -362,14 +438,16 @@ function mapHistoryToTurns(history: readonly BackendMessage[]) {
             typeof block.id === "string" && block.id.length > 0
               ? block.id
               : `${message.id}_tool_${index}`;
+          const toolName = typeof block.name === "string" ? block.name : "tool";
+          const presentation = inferHistoryCommandPresentation(toolName, block.arguments, cwd);
           const commandItem: Record<string, unknown> = {
             type: "commandExecution",
             id: `${message.id}_tool_${index}`,
-            command: toolCallCommandFromHistory(block),
-            cwd: "",
+            command: presentation.command,
+            cwd,
             processId: null,
             status: "inProgress",
-            commandActions: [],
+            commandActions: presentation.commandActions,
             aggregatedOutput: null,
             exitCode: null,
             durationMs: null,
@@ -396,11 +474,14 @@ function mapHistoryToTurns(history: readonly BackendMessage[]) {
       const payload = isRecord(message.content) ? message.content : {};
       const toolCallId = typeof payload.toolCallId === "string" ? payload.toolCallId : null;
       const pending = toolCallId ? pendingToolItems.get(toolCallId) : null;
-      const outputText = textFromHistoryContent(payload.content);
+      const contentText = textFromHistoryContent(payload.content);
+      const parsedOutput = parseFormattedExecTranscript(contentText);
+      const outputText = parsedOutput?.output ?? contentText;
       if (pending) {
         pending.aggregatedOutput = outputText || null;
         pending.status = payload.isError ? "failed" : "completed";
-        pending.exitCode = payload.isError ? 1 : 0;
+        pending.exitCode = parsedOutput?.exitCode ?? (payload.isError ? 1 : 0);
+        pending.processId = parsedOutput?.processId ?? null;
         pending.durationMs = 0;
         if (toolCallId) {
           pendingToolItems.delete(toolCallId);
@@ -636,7 +717,7 @@ export class PiBackend implements IBackend {
 
   async threadRead(input: BackendThreadReadInput): Promise<BackendThreadReadResult> {
     let turns = input.includeTurns
-      ? mapHistoryToTurns(await this.readSessionHistory(input.threadHandle))
+      ? mapHistoryToTurns(await this.readSessionHistory(input.threadHandle), input.cwd)
       : [];
     const runtime = this.threadRuntimes.get(input.threadHandle);
     if (input.includeTurns && runtime?.machine) {

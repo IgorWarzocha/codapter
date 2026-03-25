@@ -769,6 +769,90 @@ describe("PiBackend", () => {
     }
   });
 
+  it("strips unified exec transcript wrappers when hydrating thread history", async () => {
+    const backend = createPiBackend();
+
+    try {
+      await backend.initialize();
+      (
+        backend as PiBackend & { readSessionHistory(sessionId: string): Promise<unknown[]> }
+      ).readSessionHistory = async (sessionId: string) => {
+        expect(sessionId).toBe("thread-history");
+        return [
+          {
+            id: "user-1",
+            role: "user",
+            content: [{ type: "text", text: "run date" }],
+            timestamp: Date.now(),
+          },
+          {
+            id: "assistant-tool-1",
+            role: "assistant",
+            content: [
+              {
+                type: "toolCall",
+                id: "tool-1",
+                name: "exec_command",
+                arguments: { cmd: "date" },
+              },
+            ],
+            timestamp: Date.now(),
+          },
+          {
+            id: "tool-result-1",
+            role: "toolResult",
+            content: {
+              toolCallId: "tool-1",
+              toolName: "exec_command",
+              isError: false,
+              content: [
+                {
+                  type: "text",
+                  text: "Command: date\nChunk ID: abc123\nWall time: 0.0100 seconds\nProcess exited with code 0\nOriginal token count: 3\nOutput:\nMon Mar 23 21:22:00 CDT 2026\n",
+                },
+              ],
+            },
+            timestamp: Date.now(),
+          },
+        ];
+      };
+      (
+        backend as PiBackend & {
+          requireRecord(
+            sessionId: string
+          ): Promise<{ sessionName: string | null; modelId: string | null }>;
+        }
+      ).requireRecord = async (sessionId: string) => {
+        expect(sessionId).toBe("thread-history");
+        return {
+          sessionName: null,
+          modelId: null,
+        };
+      };
+
+      const threadRead = await backend.threadRead({
+        threadId: "thread-history",
+        threadHandle: "thread-history",
+        includeTurns: true,
+        cwd: "/repo",
+      });
+
+      expect(threadRead.turns[0]?.items).toEqual(
+        expect.arrayContaining([
+          expect.objectContaining({
+            type: "commandExecution",
+            command: "date",
+            cwd: "/repo",
+            aggregatedOutput: "Mon Mar 23 21:22:00 CDT 2026\n",
+            exitCode: 0,
+          }),
+        ])
+      );
+    } finally {
+      await backend.dispose();
+    }
+  });
+
   it("dedupes concurrent available-model probes into a single Pi process launch", async () => {
     const rootDir = await mkdtemp(join(tmpdir(), "codapter-backend-pi-model-dedupe-"));
     const sessionDir = join(rootDir, "sessions");

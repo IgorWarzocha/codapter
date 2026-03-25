@@ -6,6 +6,82 @@ type ParsedCommandAction =
   | { type: "search"; command: string; query?: string; path?: string }
   | { type: "unknown"; command: string };
 
+type CommandPresentation = {
+  command: string;
+  commandActions: JsonValue[];
+};
+
+const EXPLORATION_TOOL_TOKENS = new Set([
+  "explore",
+  "find",
+  "grep",
+  "list",
+  "ls",
+  "read",
+  "search",
+]);
+
+function tokenizeToolName(toolName: string): string[] {
+  return toolName
+    .toLowerCase()
+    .split(/[^a-z0-9]+/u)
+    .filter((token) => token.length > 0);
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null;
+}
+
+export function inferCommandString(input: unknown): string {
+  if (typeof input === "string") {
+    return input;
+  }
+  if (!input || typeof input !== "object") {
+    return "";
+  }
+  const record = input as Record<string, unknown>;
+  if (Array.isArray(record.command)) {
+    return record.command.filter((value): value is string => typeof value === "string").join(" ");
+  }
+  if (typeof record.command === "string") {
+    return record.command;
+  }
+  if (Array.isArray(record.cmd)) {
+    return record.cmd.filter((value): value is string => typeof value === "string").join(" ");
+  }
+  if (typeof record.cmd === "string") {
+    return record.cmd;
+  }
+  return "";
+}
+
+export function inferCommandPresentation(
+  toolName: string,
+  input: unknown,
+  cwd: string
+): CommandPresentation {
+  const explicitCommand = inferCommandString(input).trim();
+  if (explicitCommand.length > 0) {
+    return {
+      command: explicitCommand,
+      commandActions: inferCommandActions(explicitCommand, cwd),
+    };
+  }
+
+  const inferredAction = inferToolActionFromName(toolName, input, cwd);
+  if (inferredAction) {
+    return {
+      command: describeCommandAction(inferredAction, toolName),
+      commandActions: [inferredAction],
+    };
+  }
+
+  return {
+    command: toolName,
+    commandActions: inferCommandActions(toolName, cwd),
+  };
+}
+
 export function inferCommandActions(command: string, cwd: string): JsonValue[] {
   const trimmed = command.trim();
   if (trimmed.length === 0) {
@@ -54,6 +130,99 @@ function parseCommandActions(command: string, cwd: string): ParsedCommandAction[
     return [{ type: "unknown", command }];
   }
   return dedupeActions(actions);
+}
+
+function inferToolActionFromName(
+  toolName: string,
+  input: unknown,
+  cwd: string
+): ParsedCommandAction | null {
+  const tokens = tokenizeToolName(toolName);
+  if (!tokens.some((token) => EXPLORATION_TOOL_TOKENS.has(token))) {
+    return null;
+  }
+
+  const record = isRecord(input) ? input : {};
+  const path = pathFromToolInput(record);
+  const query = queryFromToolInput(record);
+
+  if (tokens.includes("read")) {
+    return path ? readAction(toolName, path, cwd) : { type: "unknown", command: toolName };
+  }
+
+  if (tokens.includes("search") || tokens.includes("find") || tokens.includes("grep")) {
+    return {
+      type: "search",
+      command: toolName,
+      ...(query ? { query } : {}),
+      ...(path ? { path: shortDisplayPath(path) } : {}),
+    };
+  }
+
+  if (tokens.includes("explore") || tokens.includes("list") || tokens.includes("ls")) {
+    return {
+      type: "list",
+      command: toolName,
+      ...(path ? { path: shortDisplayPath(path) } : {}),
+    };
+  }
+
+  return null;
+}
+
+function describeCommandAction(action: ParsedCommandAction, toolName: string): string {
+  switch (action.type) {
+    case "read":
+      return `Read ${action.name}`;
+    case "search":
+      if (action.path && action.query) {
+        return `Search ${action.path} for ${action.query}`;
+      }
+      if (action.query) {
+        return `Search for ${action.query}`;
+      }
+      if (action.path) {
+        return `Search ${action.path}`;
+      }
+      return "Search workspace";
+    case "list":
+      if (action.path) {
+        return `List ${action.path}`;
+      }
+      return tokenizeToolName(toolName).includes("explore")
+        ? "Explore workspace"
+        : "List workspace";
+    case "unknown":
+      return action.command;
+  }
+}
+
+function pathFromToolInput(record: Record<string, unknown>): string | undefined {
+  for (const key of [
+    "path",
+    "file",
+    "filePath",
+    "filepath",
+    "filename",
+    "relative_path",
+    "relativePath",
+  ]) {
+    const value = record[key];
+    if (typeof value === "string" && value.length > 0) {
+      return value;
+    }
+  }
+  return undefined;
+}
+
+function queryFromToolInput(record: Record<string, unknown>): string | undefined {
+  for (const key of ["query", "pattern", "search", "needle", "text", "match"]) {
+    const value = record[key];
+    if (typeof value === "string" && value.length > 0) {
+      return value;
+    }
+  }
+  return undefined;
 }
 
 function dedupeActions(actions: ParsedCommandAction[]): ParsedCommandAction[] {

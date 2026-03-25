@@ -1,6 +1,7 @@
 import { randomUUID } from "node:crypto";
 import type { BackendEvent, BackendTokenUsage } from "./backend.js";
-import { inferCommandActions } from "./command-actions.js";
+import { inferCommandPresentation } from "./command-actions.js";
+import { parseCommandToolOutput } from "./command-output.js";
 import type { JsonValue, ThreadItem, ThreadTokenUsage, Turn, TurnError } from "./protocol.js";
 import { classifyToolName, synthesizeFileChanges } from "./tool-items.js";
 
@@ -36,30 +37,12 @@ function textFromUnknown(value: unknown): string {
   return JSON.stringify(value);
 }
 
-function inferCommand(input: unknown): string {
-  if (typeof input === "string") {
-    return input;
-  }
-  if (!input || typeof input !== "object") {
-    return "";
-  }
-  const record = input as Record<string, unknown>;
-  if (Array.isArray(record.command)) {
-    return record.command.filter((value): value is string => typeof value === "string").join(" ");
-  }
-  if (typeof record.command === "string") {
-    return record.command;
-  }
-  if (Array.isArray(record.cmd)) {
-    return record.cmd.filter((value): value is string => typeof value === "string").join(" ");
-  }
-  if (typeof record.cmd === "string") {
-    return record.cmd;
-  }
-  return "";
-}
-
 function toolOutputText(output: unknown): string {
+  const commandOutput = parseCommandToolOutput(output);
+  if (commandOutput) {
+    return commandOutput.output;
+  }
+
   if (!output || typeof output !== "object") {
     return textFromUnknown(output);
   }
@@ -229,18 +212,17 @@ export class TurnStateMachine {
 
     const id = randomUUID();
     const kind = classifyToolName(toolName);
-    const command = inferCommand(input);
-    const displayCommand = command || toolName;
+    const presentation = inferCommandPresentation(toolName, input, this.cwd);
     const item: ThreadItem =
       kind === "commandExecution"
         ? {
             type: "commandExecution",
             id,
-            command: displayCommand,
+            command: presentation.command,
             cwd: this.cwd,
             processId: null,
             status: "inProgress",
-            commandActions: inferCommandActions(displayCommand, this.cwd),
+            commandActions: presentation.commandActions,
             aggregatedOutput: null,
             exitCode: null,
             durationMs: null,
@@ -313,6 +295,13 @@ export class TurnStateMachine {
     }
 
     if (state.item.type === "commandExecution") {
+      const commandOutput = parseCommandToolOutput(output);
+      if (commandOutput?.processId) {
+        state.item.processId = commandOutput.processId;
+      }
+      if (commandOutput?.exitCode !== null && commandOutput?.exitCode !== undefined) {
+        state.item.exitCode = commandOutput.exitCode;
+      }
       state.item.aggregatedOutput = (state.item.aggregatedOutput ?? "") + delta;
       state.emittedOutputDelta = true;
       await this.sink.notify("item/commandExecution/outputDelta", {
@@ -365,12 +354,16 @@ export class TurnStateMachine {
     await this.applyToolOutput(state, output, true);
 
     if (state.item.type === "commandExecution") {
-      const outputText = toolOutputText(output);
+      const commandOutput = parseCommandToolOutput(output);
+      const outputText = commandOutput?.output ?? toolOutputText(output);
       if (outputText && !state.item.aggregatedOutput) {
         state.item.aggregatedOutput = outputText;
       }
+      if (commandOutput?.processId) {
+        state.item.processId = commandOutput.processId;
+      }
       state.item.status = isError ? "failed" : "completed";
-      state.item.exitCode = isError ? 1 : 0;
+      state.item.exitCode = commandOutput?.exitCode ?? (isError ? 1 : 0);
       state.item.durationMs = Date.now() - state.startedAt;
     }
 
