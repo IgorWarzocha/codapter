@@ -1,10 +1,10 @@
 export * from "./app-server.js";
 export * from "./backend.js";
 export * from "./backend-router.js";
-export * from "./collab-uds.js";
 export * from "./collab-manager.js";
 export * from "./collab-nicknames.js";
 export * from "./collab-types.js";
+export * from "./collab-uds.js";
 export * from "./command-exec.js";
 export * from "./config-store.js";
 export * from "./jsonrpc.js";
@@ -12,3 +12,4 @@ export * from "./ndjson.js";
 export * from "./protocol.js";
 export * from "./thread-registry.js";
 export * from "./turn-state.js";
+export * from "./version.js";

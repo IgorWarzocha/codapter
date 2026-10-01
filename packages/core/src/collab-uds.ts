@@ -3,7 +3,7 @@ import { chmod, mkdir, rm } from "node:fs/promises";
 import net from "node:net";
 import { dirname } from "node:path";
 import type { CollabManager } from "./collab-manager.js";
-import { type JsonRpcRequest, failure, isJsonRpcRequest, success } from "./jsonrpc.js";
+import { failure, isJsonRpcRequest, type JsonRpcRequest, success } from "./jsonrpc.js";
 import type { JsonValue, UserInput } from "./protocol.js";
 
 const JSON_RPC_PARSE_ERROR = -32700;
@@ -76,13 +76,19 @@ function textFromUserInputs(items: readonly UserInput[]): string {
         case "text":
           return [item.text];
         case "image":
-          return [`[image] ${item.url}`];
+          return [`[image] ${item.url ?? item.fileId}`];
         case "localImage":
           return [`[local image] ${item.path}`];
+        case "audio":
+          return [`[audio] ${item.url}`];
+        case "localAudio":
+          return [`[local audio] ${item.path}`];
         case "skill":
           return [`[skill:${item.name}] ${item.path}`];
         case "mention":
           return [`[mention:${item.name}] ${item.path}`];
+        default:
+          throw new Error("Unsupported collaboration input type");
       }
     })
     .join("\n")

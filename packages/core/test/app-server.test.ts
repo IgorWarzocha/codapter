@@ -4,8 +4,6 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, expect, it, vi } from "vitest";
 import { AppServerConnection } from "../src/app-server.js";
-import { BackendRouter } from "../src/backend-router.js";
-import { parseBackendModelId } from "../src/backend.js";
 import type {
   BackendAppServerEvent,
   BackendEvent,
@@ -14,6 +12,8 @@ import type {
   BackendSessionLaunchConfig,
   IBackend,
 } from "../src/backend.js";
+import { parseBackendModelId } from "../src/backend.js";
+import { BackendRouter } from "../src/backend-router.js";
 import { InMemoryConfigStore } from "../src/config-store.js";
 import { ThreadRegistry } from "../src/thread-registry.js";
 import { TurnStateMachine, toThreadTokenUsage } from "../src/turn-state.js";
@@ -863,6 +863,10 @@ describe("AppServerConnection", () => {
       id: 2,
       result: {
         rateLimits: {
+          normalModelSlug: null,
+          individualLimit: null,
+          spendControlReached: null,
+          rateLimitReachedType: null,
           limitId: null,
           limitName: null,
           primary: null,
@@ -1453,6 +1457,12 @@ describe("AppServerConnection", () => {
             upgrade: null,
             upgradeInfo: null,
             availabilityNux: null,
+            modelSpecialty: null,
+            multiAgentVersion: null,
+            additionalSpeedTiers: [],
+            serviceTiers: [],
+            defaultServiceTier: null,
+            availableAccessPrograms: null,
             displayName: "pi / GPT-5.4 Mini",
             description: "Fast model",
             hidden: false,
@@ -1641,6 +1651,12 @@ describe("AppServerConnection", () => {
             upgrade: null,
             upgradeInfo: null,
             availabilityNux: null,
+            modelSpecialty: null,
+            multiAgentVersion: null,
+            additionalSpeedTiers: [],
+            serviceTiers: [],
+            defaultServiceTier: null,
+            availableAccessPrograms: null,
             displayName: "GPT-5.4",
             description: "Codex model",
             hidden: false,
@@ -1661,6 +1677,12 @@ describe("AppServerConnection", () => {
             upgrade: null,
             upgradeInfo: null,
             availabilityNux: null,
+            modelSpecialty: null,
+            multiAgentVersion: null,
+            additionalSpeedTiers: [],
+            serviceTiers: [],
+            defaultServiceTier: null,
+            availableAccessPrograms: null,
             displayName: "pi / Claude Opus 4.6 (Anthropic)",
             description: "Pi model",
             hidden: false,
@@ -2042,6 +2064,7 @@ describe("AppServerConnection", () => {
         result: {
           data: [],
           nextCursor: null,
+          backwardsCursor: null,
         },
       });
 
@@ -2673,7 +2696,7 @@ describe("AppServerConnection", () => {
           };
         };
       };
-      expect(childRead.result.thread.status).toEqual({ type: "active", activeFlags: ["turn"] });
+      expect(childRead.result.thread.status).toEqual({ type: "active", activeFlags: [] });
       expect(childRead.result.thread.source).toMatchObject({
         subAgent: {
           thread_spawn: {
@@ -2696,7 +2719,7 @@ describe("AppServerConnection", () => {
         result: {
           thread: {
             id: childThreadId,
-            status: { type: "active", activeFlags: ["turn"] },
+            status: { type: "active", activeFlags: [] },
           },
         },
       });
@@ -3545,7 +3568,7 @@ describe("AppServerConnection", () => {
         result: {
           thread: {
             id: childThreadId,
-            status: { type: "active", activeFlags: ["turn"] },
+            status: { type: "active", activeFlags: [] },
             turns: [
               {
                 items: [
@@ -3667,7 +3690,7 @@ describe("AppServerConnection", () => {
         result: {
           thread: {
             id: childThreadId,
-            status: { type: "active", activeFlags: ["turn"] },
+            status: { type: "active", activeFlags: [] },
             turns: [
               {
                 items: [
@@ -4241,7 +4264,6 @@ describe("AppServerConnection", () => {
           notification.params.thread.id !== started.result.thread.id
       ) as { params: { thread: { id: string } } } | undefined;
       expect(childStarted).toBeDefined();
-      const childThreadId = childStarted?.params.thread.id ?? "";
 
       await expect(
         callSocket(socketPath ?? "", {
@@ -4600,6 +4622,7 @@ describe("AppServerConnection", () => {
         result: {
           data: [],
           nextCursor: null,
+          backwardsCursor: null,
         },
       });
 
@@ -4651,6 +4674,7 @@ describe("AppServerConnection", () => {
         result: {
           data: [],
           nextCursor: null,
+          backwardsCursor: null,
         },
       });
 
@@ -6386,7 +6410,7 @@ describe("AppServerConnection", () => {
         },
       });
 
-      const started = (await connection.handleMessage({
+      await connection.handleMessage({
         id: 2,
         method: "thread/start",
         params: {
@@ -6395,7 +6419,7 @@ describe("AppServerConnection", () => {
           experimentalRawEvents: false,
           persistExtendedHistory: false,
         },
-      })) as { result: { thread: { id: string } } };
+      });
 
       backend.emit("codex_thread_handle", {
         kind: "notification",

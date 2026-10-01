@@ -1,4 +1,3 @@
-import { type ChildProcessWithoutNullStreams, spawn } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import { appendFile, mkdir, readFile } from "node:fs/promises";
 import { dirname } from "node:path";
@@ -6,11 +5,17 @@ import type {
   BackendEvent,
   BackendImageInput,
   BackendMessage,
-  BackendModelSummary,
   BackendSessionLaunchConfig,
   BackendTokenUsage,
 } from "@codapter/core";
-import { attachJsonlLineReader, parseJsonLine, serializeJsonLine } from "./jsonl.js";
+import { assistantMessageText, mapBackendMessages, mapTokenUsage } from "./message-mapping.js";
+import {
+  parseStateModelContextWindow,
+  parseStateModelId,
+  parseUpstreamModelFromResponse,
+  type UpstreamModel,
+} from "./model-catalog.js";
+import { type PiProcessResponse, PiRpcTransport } from "./rpc-transport.js";
 import type { PiBackendSessionRecord } from "./state-store.js";
 
 export interface PiProcessLaunchOptions {
@@ -22,12 +27,7 @@ export interface PiProcessLaunchOptions {
   readonly cwd?: string;
   readonly collabExtensionPath?: string | null;
   readonly launchConfig?: BackendSessionLaunchConfig;
-}
-
-export interface PiProcessResponse<T = unknown> {
-  readonly success: boolean;
-  readonly data?: T;
-  readonly error?: string;
+  readonly requestTimeoutMs?: number;
 }
 
 interface PiImageContent {
@@ -42,20 +42,7 @@ export interface PiSessionStateSnapshot {
   readonly sessionName: string | undefined;
   readonly modelId: string | undefined;
   readonly modelContextWindow: number | null;
-}
-
-type PendingRequest = {
-  resolve: (response: PiProcessResponse) => void;
-  reject: (error: Error) => void;
-};
-
-interface UpstreamModel {
-  readonly provider: string;
-  readonly id: string;
-  readonly name?: string;
-  readonly reasoning?: boolean;
-  readonly input?: readonly ("text" | "image")[];
-  readonly contextWindow?: number;
+  readonly reasoningEffort: string | undefined;
 }
 
 interface UpstreamSessionState {
@@ -63,6 +50,10 @@ interface UpstreamSessionState {
   readonly sessionFile?: string;
   readonly sessionName?: string;
   readonly model?: UpstreamModel;
+  readonly thinkingLevel?: string;
+  readonly isStreaming?: boolean;
+  readonly isCompacting?: boolean;
+  readonly pendingMessageCount?: number;
 }
 
 interface PiLogRecord {
@@ -112,183 +103,8 @@ class PiLogWriter {
   }
 }
 
-function defaultCommand(): string {
-  return "npx";
-}
-
-function defaultArgs(sessionDir: string, collabExtensionPath?: string | null): string[] {
-  return [
-    "--yes",
-    "@mariozechner/pi-coding-agent",
-    "--mode",
-    "rpc",
-    "--session-dir",
-    sessionDir,
-    ...(collabExtensionPath ? ["--extension", collabExtensionPath] : []),
-  ];
-}
-
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null;
-}
-
-function normalizeModelKey(provider: string, id: string): string {
-  return `${provider}/${id}`;
-}
-
-function mapTokenUsage(stats: unknown): BackendTokenUsage {
-  const record = isRecord(stats) ? stats : {};
-  const tokens = isRecord(record.tokens)
-    ? record.tokens
-    : isRecord(record.tokenUsage)
-      ? record.tokenUsage
-      : isRecord((record as { token_usage?: unknown }).token_usage)
-        ? ((record as { token_usage?: unknown }).token_usage as Record<string, unknown>)
-        : isRecord((record as { statistics?: unknown }).statistics)
-          ? ((record as { statistics?: unknown }).statistics as Record<string, unknown>)
-          : {};
-
-  const parseCount = (value: unknown): number => {
-    if (typeof value === "number" && Number.isFinite(value)) {
-      return value;
-    }
-    if (typeof value === "string" && value.trim().length > 0) {
-      const parsed = Number(value);
-      return Number.isFinite(parsed) ? parsed : 0;
-    }
-    return 0;
-  };
-
-  const toTokenCount = (primary: unknown, ...fallbacks: unknown[]) => {
-    const fallbackKeys = [primary, ...fallbacks];
-    for (const value of fallbackKeys) {
-      const parsed = parseCount(value);
-      if (parsed !== 0 || value === 0) {
-        return parsed;
-      }
-    }
-    return 0;
-  };
-
-  const inputTokens = toTokenCount(
-    tokens.input,
-    (tokens as { inputTokens?: unknown }).inputTokens,
-    (tokens as { input_tokens?: unknown }).input_tokens
-  );
-  const outputTokens = toTokenCount(
-    tokens.output,
-    (tokens as { outputTokens?: unknown }).outputTokens,
-    (tokens as { output_tokens?: unknown }).output_tokens
-  );
-  const cacheRead = toTokenCount(
-    tokens.cacheRead,
-    (tokens as { cachedInputTokens?: unknown }).cachedInputTokens,
-    (tokens as { cache_read?: unknown }).cache_read
-  );
-  const cacheWrite = toTokenCount(
-    tokens.cacheWrite,
-    (tokens as { cachedOutputTokens?: unknown }).cachedOutputTokens,
-    (tokens as { cache_write?: unknown }).cache_write
-  );
-  const totalTokens = toTokenCount(
-    tokens.total,
-    (tokens as { totalTokens?: unknown }).totalTokens,
-    (tokens as { total_tokens?: unknown }).total_tokens
-  );
-
-  return {
-    input: inputTokens,
-    output: outputTokens,
-    cacheRead,
-    cacheWrite,
-    total: totalTokens,
-    modelContextWindow: null,
-  };
-}
-
-function mapUpstreamModel(model: unknown, index: number): BackendModelSummary | null {
-  if (!isRecord(model)) {
-    return null;
-  }
-
-  const provider = typeof model.provider === "string" ? model.provider : "pi";
-  const id = typeof model.id === "string" ? model.id : "unknown";
-  const combinedId = normalizeModelKey(provider, id);
-  const displayName = typeof model.name === "string" && model.name.length > 0 ? model.name : id;
-  const reasoning = Boolean(model.reasoning);
-  const inputModalities = Array.isArray(model.input)
-    ? model.input.filter((value): value is string => typeof value === "string")
-    : ["text"];
-
-  return {
-    id: combinedId,
-    model: combinedId,
-    displayName,
-    description: displayName,
-    hidden: false,
-    isDefault: index === 0,
-    inputModalities,
-    supportedReasoningEfforts: reasoning
-      ? [
-          {
-            reasoningEffort: "minimal",
-            description: "Fast responses with lighter reasoning",
-          },
-          {
-            reasoningEffort: "low",
-            description: "Balances speed with some reasoning",
-          },
-          {
-            reasoningEffort: "medium",
-            description: "Provides a solid balance of reasoning depth and latency",
-          },
-          {
-            reasoningEffort: "high",
-            description: "Greater reasoning depth for complex problems",
-          },
-          {
-            reasoningEffort: "xhigh",
-            description: "Extra high reasoning depth for complex problems",
-          },
-        ]
-      : [
-          {
-            reasoningEffort: "none",
-            description: "No additional reasoning",
-          },
-        ],
-    defaultReasoningEffort: reasoning ? "medium" : "none",
-    supportsPersonality: false,
-  };
-}
-
-function mapMessage(message: unknown, index: number): BackendMessage {
-  const record = isRecord(message) ? message : {};
-  const timestamp =
-    typeof record.timestamp === "number"
-      ? new Date(record.timestamp).toISOString()
-      : typeof record.timestamp === "string"
-        ? new Date(record.timestamp).toISOString()
-        : new Date().toISOString();
-
-  return {
-    id:
-      typeof record.id === "string"
-        ? record.id
-        : typeof record.entryId === "string"
-          ? record.entryId
-          : `message-${index}`,
-    role: typeof record.role === "string" ? record.role : "unknown",
-    content:
-      record.role === "toolResult"
-        ? structuredClone(record)
-        : typeof record.content === "string" ||
-            Array.isArray(record.content) ||
-            isRecord(record.content)
-          ? structuredClone(record.content)
-          : structuredClone(record),
-    createdAt: timestamp,
-  };
 }
 
 function messageRole(message: unknown): string | null {
@@ -307,62 +123,6 @@ function messageStopReason(message: unknown): string | null {
 
 function isToolUseAssistantMessage(message: unknown): boolean {
   return messageRole(message) === "assistant" && messageStopReason(message) === "toolUse";
-}
-
-function textFromUnknown(value: unknown): string {
-  if (typeof value === "string") {
-    return value;
-  }
-  if (value === null || value === undefined) {
-    return "";
-  }
-  return JSON.stringify(value);
-}
-
-function assistantMessageText(message: unknown): string | null {
-  if (!isRecord(message)) {
-    return null;
-  }
-
-  const content = message.content;
-  if (typeof content === "string") {
-    return content;
-  }
-  if (!Array.isArray(content)) {
-    return null;
-  }
-
-  const text = content
-    .map((entry) => {
-      if (!isRecord(entry)) {
-        return textFromUnknown(entry);
-      }
-      if (entry.type === "text" && typeof entry.text === "string") {
-        return entry.text;
-      }
-      return textFromUnknown(entry);
-    })
-    .join("");
-
-  return text.length > 0 ? text : null;
-}
-
-export function mapAvailableModelsToSummaries(models: unknown): BackendModelSummary[] {
-  if (!Array.isArray(models)) {
-    return [];
-  }
-
-  return models
-    .map((model, index) => mapUpstreamModel(model, index))
-    .filter((model): model is BackendModelSummary => model !== null);
-}
-
-export function mapBackendMessages(messages: unknown): BackendMessage[] {
-  if (!Array.isArray(messages)) {
-    return [];
-  }
-
-  return messages.map((message, index) => mapMessage(message, index));
 }
 
 export function mapSessionRecordFromSnapshot(
@@ -384,38 +144,34 @@ export function mapSessionRecordFromSnapshot(
   };
 }
 
+export type PiProcessEvent =
+  | BackendEvent
+  | { readonly type: "disconnect"; readonly message: string }
+  | { readonly type: "extension_error"; readonly message: string };
+
 export class PiProcessSession {
   private readonly opaqueSessionId: string;
-  private readonly command: string;
-  private readonly args: readonly string[];
-  private readonly env: NodeJS.ProcessEnv;
-  private readonly cwd: string;
-  private process: ChildProcessWithoutNullStreams | null = null;
-  private stopReadingStdout: (() => void) | null = null;
-  private readonly pending = new Map<string, PendingRequest>();
-  private readonly listeners = new Set<(event: BackendEvent) => void>();
-  private requestCounter = 0;
+  private readonly transport: PiRpcTransport;
+  private readonly listeners = new Set<(event: PiProcessEvent) => void>();
+  private completion: { text?: string; error?: string } = {};
   private currentTurnId: string | null = null;
+  private nativeRunStarted = false;
+  private promptAbort: AbortController | null = null;
   private currentSessionFile: string | undefined;
   private currentSessionName: string | undefined;
   private currentModelContextWindow: number | null = null;
   private readonly logWriter: PiLogWriter | null;
-  private lastExitCode: number | null = null;
-  private lastExitSignal: NodeJS.Signals | null = null;
-  private stderr = "";
-
   constructor(options: PiProcessLaunchOptions) {
     this.opaqueSessionId = options.opaqueSessionId;
-    this.command = options.command ?? defaultCommand();
-    this.args = options.args
-      ? [
-          ...options.args,
-          "--session-dir",
-          options.sessionDir,
-          ...(options.collabExtensionPath ? ["--extension", options.collabExtensionPath] : []),
-        ]
-      : defaultArgs(options.sessionDir, options.collabExtensionPath);
-    this.env = {
+    const command = options.command ?? "pi";
+    const args = [
+      ...(options.args ?? ["--mode", "rpc"]),
+      "--session-dir",
+      options.sessionDir,
+      ...(options.collabExtensionPath ? ["--extension", options.collabExtensionPath] : []),
+    ];
+    const env: NodeJS.ProcessEnv = {
+      ...process.env,
       ...(options.env ?? process.env),
       ...(options.launchConfig?.collabSocketPath
         ? { CODAPTER_COLLAB_UDS: options.launchConfig.collabSocketPath }
@@ -430,19 +186,52 @@ export class PiProcessSession {
           }
         : {}),
     };
-    this.cwd = options.cwd ?? process.cwd();
-    const logFilePath = this.env.CODAPTER_DEBUG_LOG_FILE;
+    const cwd = options.cwd ?? process.cwd();
+    const logFilePath = env.CODAPTER_DEBUG_LOG_FILE;
     this.logWriter =
       typeof logFilePath === "string" && logFilePath.length > 0
         ? new PiLogWriter(logFilePath)
         : null;
+    const requestTimeoutMs = options.requestTimeoutMs ?? 60_000;
+    if (!Number.isFinite(requestTimeoutMs) || requestTimeoutMs <= 0) {
+      throw new Error("Pi requestTimeoutMs must be a positive finite number");
+    }
+    this.transport = new PiRpcTransport({
+      command,
+      args,
+      env,
+      cwd,
+      requestTimeoutMs,
+      onEvent: (event) => this.handleEvent(event),
+      onDisconnect: (error) => {
+        if (this.currentTurnId) {
+          this.emit({
+            sessionId: this.opaqueSessionId,
+            turnId: this.currentTurnId,
+            type: "error",
+            message: error.message,
+          });
+          this.currentTurnId = null;
+        }
+        this.emit({ type: "disconnect", message: error.message });
+      },
+      log: (kind, raw, pid) =>
+        this.logWriter?.write({
+          at: new Date().toISOString(),
+          component: "pi-process",
+          kind,
+          raw,
+          ...(pid !== undefined ? { pid } : {}),
+          ...(kind === "startup" ? { command, sessionId: this.opaqueSessionId } : {}),
+        }),
+    });
   }
 
   isRunning(): boolean {
-    return this.process !== null;
+    return this.transport.isRunning();
   }
 
-  addListener(listener: (event: BackendEvent) => void): { dispose(): void } {
+  addListener(listener: (event: PiProcessEvent) => void): { dispose(): void } {
     this.listeners.add(listener);
     return {
       dispose: () => {
@@ -489,15 +278,22 @@ export class PiProcessSession {
     return snapshot;
   }
 
-  async forkSession(entryId: string): Promise<{ cancelled: boolean; text?: string }> {
-    await this.ensureStarted();
-    const response = await this.sendRequest<{ cancelled: boolean; text?: string }>({
-      type: "fork",
-      entryId,
-    });
-    return response.data?.text === undefined
-      ? { cancelled: Boolean(response.data?.cancelled) }
-      : { cancelled: Boolean(response.data?.cancelled), text: response.data.text };
+  async cloneSession(): Promise<void> {
+    const response = await this.sendRequest<{ cancelled: boolean }>({ type: "clone" });
+    if (response.data?.cancelled) throw new Error("Pi clone was cancelled");
+    this.applySnapshot(await this.getState());
+  }
+
+  get isBusy(): boolean {
+    return this.currentTurnId !== null;
+  }
+
+  async setThinkingLevel(effort: string): Promise<void> {
+    const level = effort === "none" ? "off" : effort;
+    if (!["off", "minimal", "low", "medium", "high", "xhigh", "max"].includes(level)) {
+      throw new Error(`Unsupported Pi reasoning effort: ${effort}`);
+    }
+    await this.sendRequest({ type: "set_thinking_level", level });
   }
 
   async prompt(
@@ -505,12 +301,34 @@ export class PiProcessSession {
     message: string,
     images?: readonly BackendImageInput[]
   ): Promise<void> {
-    await this.ensureStarted();
+    if (this.currentTurnId) throw new Error("Pi session already has an active turn");
     this.currentTurnId = turnId;
-    await this.sendRequest({ type: "prompt", message, images: await this.convertImages(images) });
+    this.nativeRunStarted = false;
+    const abort = new AbortController();
+    this.promptAbort = abort;
+    this.completion = {};
+    try {
+      await this.ensureStarted();
+      abort.signal.throwIfAborted();
+      const converted = await this.convertImages(images, abort.signal);
+      abort.signal.throwIfAborted();
+      const response = await this.sendRequest<{ disposition?: string }>({
+        type: "prompt",
+        message,
+        images: converted,
+      });
+      if (response.data?.disposition === "handled" && this.currentTurnId === turnId) {
+        await this.finishHandledPromptIfIdle(turnId);
+      }
+    } catch (error) {
+      this.currentTurnId = null;
+      this.promptAbort = null;
+      throw error;
+    }
   }
 
   async abort(): Promise<void> {
+    this.promptAbort?.abort(new Error("Pi prompt was aborted"));
     await this.ensureStarted();
     await this.sendRequest({ type: "abort" });
   }
@@ -525,6 +343,7 @@ export class PiProcessSession {
       sessionName: typeof state?.sessionName === "string" ? state.sessionName : undefined,
       modelId: parseStateModelId(state?.model),
       modelContextWindow: parseStateModelContextWindow(state?.model),
+      reasoningEffort: typeof state?.thinkingLevel === "string" ? state.thinkingLevel : undefined,
     };
   }
 
@@ -556,6 +375,19 @@ export class PiProcessSession {
     return response.data?.models ?? [];
   }
 
+  async getAvailableThinkingLevels(): Promise<readonly string[]> {
+    const response = await this.sendRequest<{ levels: unknown }>({
+      type: "get_available_thinking_levels",
+    });
+    if (
+      !Array.isArray(response.data?.levels) ||
+      !response.data.levels.every((level) => typeof level === "string")
+    ) {
+      throw new Error("Pi returned invalid thinking levels");
+    }
+    return response.data.levels;
+  }
+
   async getMessages(): Promise<BackendMessage[]> {
     await this.ensureStarted();
     const response = await this.sendRequest<{ messages: unknown[] }>({ type: "get_messages" });
@@ -571,165 +403,49 @@ export class PiProcessSession {
     };
   }
 
-  async getForkMessages(): Promise<Array<{ entryId: string; text: string }>> {
-    await this.ensureStarted();
-    const response = await this.sendRequest<{ messages: Array<{ entryId: string; text: string }> }>(
-      {
-        type: "get_fork_messages",
-      }
-    );
-    return response.data?.messages ?? [];
-  }
-
   async respondToElicitation(requestId: string, responseValue: unknown): Promise<void> {
     await this.ensureStarted();
     const response = normalizeElicitationResponse(requestId, responseValue);
-    this.writeLine(response);
+    await this.transport.write(response);
   }
 
   async dispose(): Promise<void> {
-    this.stopReadingStdout?.();
-    this.stopReadingStdout = null;
-    if (this.process) {
-      this.process.kill("SIGTERM");
-      await new Promise<void>((resolve) => {
-        const timeout = setTimeout(() => {
-          this.process?.kill("SIGKILL");
-          resolve();
-        }, 5000);
-
-        this.process?.once("exit", () => {
-          clearTimeout(timeout);
-          resolve();
-        });
-      });
-    }
-
-    this.process = null;
-    this.pending.clear();
+    this.promptAbort?.abort(new Error("Pi session has been disposed"));
+    await this.transport.dispose();
+    this.currentTurnId = null;
+    this.promptAbort = null;
     this.logWriter?.write({
       at: new Date().toISOString(),
       component: "pi-process",
       kind: "shutdown",
       raw: "",
-      exitCode: this.lastExitCode,
-      signal: this.lastExitSignal,
+      exitCode: this.transport.exitCode,
+      signal: this.transport.exitSignal,
       sessionId: this.opaqueSessionId,
     });
     await this.logWriter?.flush();
   }
 
   getStderr(): string {
-    return this.stderr;
+    return this.transport.getStderr();
   }
 
   private async ensureStarted(): Promise<void> {
-    if (this.process) {
-      return;
-    }
-
-    this.process = spawn(this.command, this.args as string[], {
-      cwd: this.cwd,
-      env: { ...process.env, ...this.env },
-      stdio: ["pipe", "pipe", "pipe"],
-    });
-
-    this.process.stderr.on("data", (chunk) => {
-      this.stderr += chunk.toString();
-      this.logWriter?.write({
-        at: new Date().toISOString(),
-        component: "pi-process",
-        kind: "stderr",
-        raw: chunk.toString(),
-      });
-    });
-
-    this.process.once("exit", (code, signal) => {
-      this.lastExitCode = code;
-      this.lastExitSignal = signal;
-      const error = new Error(
-        `Pi process exited${code !== null ? ` with code ${code}` : ""}${signal ? ` (${signal})` : ""}`
-      );
-      for (const pending of this.pending.values()) {
-        pending.reject(error);
-      }
-      this.pending.clear();
-      this.process = null;
-      this.stopReadingStdout?.();
-      this.stopReadingStdout = null;
-    });
-
-    this.stopReadingStdout = attachJsonlLineReader(this.process.stdout, (line) => {
-      void this.handleLine(line);
-    });
-
-    this.logWriter?.write({
-      at: new Date().toISOString(),
-      component: "pi-process",
-      kind: "startup",
-      ...(this.process.pid !== undefined ? { pid: this.process.pid } : {}),
-      command: this.command,
-      sessionId: this.opaqueSessionId,
-      raw: "",
-    });
-
-    await this.sendRequest({ type: "get_state" });
-  }
-
-  private async handleLine(line: string): Promise<void> {
-    this.logWriter?.write({
-      at: new Date().toISOString(),
-      component: "pi-process",
-      kind: "stdout",
-      raw: line,
-    });
-
-    let parsed: unknown;
-    try {
-      parsed = parseJsonLine(line);
-    } catch {
-      return;
-    }
-
-    if (!isRecord(parsed)) {
-      return;
-    }
-
-    if (parsed.type === "response" && typeof parsed.command === "string") {
-      const id = typeof parsed.id === "string" ? parsed.id : undefined;
-      if (!id) {
-        return;
-      }
-
-      const pending = this.pending.get(id);
-      if (!pending) {
-        return;
-      }
-
-      this.pending.delete(id);
-      if (parsed.success) {
-        pending.resolve({ success: true, data: parsed.data });
-      } else {
-        pending.reject(
-          new Error(typeof parsed.error === "string" ? parsed.error : "Pi RPC failed")
-        );
-      }
-      return;
-    }
-
-    this.handleEvent(parsed);
+    await this.transport.start();
   }
 
   private handleEvent(event: Record<string, unknown>): void {
     switch (event.type) {
+      case "agent_start":
+        this.nativeRunStarted = true;
+        return;
       case "turn_start":
         return;
       case "turn_end":
-        if (isToolUseAssistantMessage(event.message)) {
-          return;
-        }
-        this.emitTokenUsage(this.currentTurnId ?? "unknown");
-        this.currentTurnId = null;
+      case "agent_end":
+        return;
+      case "agent_settled":
+        this.finishTurn();
         return;
       case "message_update":
         this.emitMessageUpdate(event);
@@ -743,12 +459,17 @@ export class PiProcessSession {
         }
         {
           const text = assistantMessageText(event.message);
-          this.emit({
-            sessionId: this.opaqueSessionId,
-            turnId: this.currentTurnId ?? "unknown",
-            type: "message_end",
+          const message = isRecord(event.message) ? event.message : {};
+          this.completion = {
             ...(text !== null ? { text } : {}),
-          });
+            ...(message.stopReason === "error" || message.stopReason === "aborted"
+              ? {
+                  error: String(
+                    message.errorMessage ?? `Pi assistant ${String(message.stopReason)}`
+                  ),
+                }
+              : {}),
+          };
         }
         return;
       case "tool_execution_start":
@@ -800,6 +521,11 @@ export class PiProcessSession {
         }
         return;
       case "extension_error":
+        this.emit({
+          type: "extension_error",
+          message: String(event.error ?? event.message ?? "Pi extension error"),
+        });
+        return;
       case "error":
         this.emit({
           sessionId: this.opaqueSessionId,
@@ -807,9 +533,6 @@ export class PiProcessSession {
           type: "error",
           message: String(event.error ?? event.message ?? "Pi runtime error"),
         });
-        return;
-      case "agent_end":
-        this.currentTurnId = null;
         return;
       default:
         return;
@@ -883,12 +606,7 @@ export class PiProcessSession {
         emittedType: "error",
         raw: JSON.stringify(event),
       });
-      this.emit({
-        sessionId: this.opaqueSessionId,
-        turnId: this.currentTurnId ?? "unknown",
-        type: "error",
-        message: String(assistantEvent.errorMessage ?? "Pi assistant error"),
-      });
+      this.completion = { error: String(assistantEvent.errorMessage ?? "Pi assistant error") };
       return;
     }
 
@@ -905,6 +623,7 @@ export class PiProcessSession {
   private emitTokenUsage(turnId: string): void {
     void this.getSessionStats()
       .then((usage) => {
+        if (!this.transport.isRunning()) return;
         this.logWriter?.write({
           at: new Date().toISOString(),
           component: "pi-process",
@@ -920,6 +639,7 @@ export class PiProcessSession {
         });
       })
       .catch(() => {
+        if (!this.transport.isRunning()) return;
         this.logWriter?.write({
           at: new Date().toISOString(),
           component: "pi-process",
@@ -954,7 +674,7 @@ export class PiProcessSession {
       });
   }
 
-  private emit(event: BackendEvent): void {
+  private emit(event: PiProcessEvent): void {
     for (const listener of this.listeners) {
       listener(event);
     }
@@ -963,38 +683,40 @@ export class PiProcessSession {
   private async sendRequest<T = unknown>(
     command: Record<string, unknown>
   ): Promise<PiProcessResponse<T>> {
-    await this.ensureStarted();
-    const id = `${Date.now()}-${++this.requestCounter}-${randomUUID()}`;
-    const payload = { id, ...command };
-
-    return await new Promise<PiProcessResponse<T>>((resolve, reject) => {
-      this.pending.set(id, {
-        resolve: (response) => resolve(response as PiProcessResponse<T>),
-        reject,
-      });
-
-      try {
-        this.writeLine(payload);
-      } catch (error) {
-        this.pending.delete(id);
-        reject(error instanceof Error ? error : new Error(String(error)));
-      }
-    });
+    return await this.transport.request<T>(command);
   }
 
-  private writeLine(value: unknown): void {
-    if (!this.process) {
-      throw new Error("Pi process is not running");
-    }
+  private finishTurn(): void {
+    const turnId = this.currentTurnId;
+    if (!turnId) return;
+    this.currentTurnId = null;
+    this.nativeRunStarted = false;
+    this.promptAbort = null;
+    this.emitTokenUsage(turnId);
+    this.emit(
+      this.completion.error
+        ? { sessionId: this.opaqueSessionId, turnId, type: "error", message: this.completion.error }
+        : { sessionId: this.opaqueSessionId, turnId, type: "message_end", ...this.completion }
+    );
+    this.completion = {};
+  }
 
-    const line = serializeJsonLine(value);
-    this.logWriter?.write({
-      at: new Date().toISOString(),
-      component: "pi-process",
-      kind: "stdin",
-      raw: line.trimEnd(),
-    });
-    this.process.stdin.write(line);
+  private async finishHandledPromptIfIdle(turnId: string): Promise<void> {
+    if (this.nativeRunStarted) return;
+    // "handled" describes this input, not work pi.sendUserMessage started.
+    // Query after the acknowledgement to catch activity that begins asynchronously.
+    // agent_start/settled may arrive while this state request is outstanding.
+    const response = await this.sendRequest<UpstreamSessionState>({ type: "get_state" });
+    const state = response.data;
+    if (
+      this.currentTurnId === turnId &&
+      !this.nativeRunStarted &&
+      !state?.isStreaming &&
+      !state?.isCompacting &&
+      !(state?.pendingMessageCount && state.pendingMessageCount > 0)
+    ) {
+      this.finishTurn();
+    }
   }
 
   private applySnapshot(snapshot: PiSessionStateSnapshot): void {
@@ -1004,7 +726,8 @@ export class PiProcessSession {
   }
 
   private async convertImages(
-    images?: readonly BackendImageInput[]
+    images?: readonly BackendImageInput[],
+    signal?: AbortSignal
   ): Promise<readonly PiImageContent[] | undefined> {
     if (!images || images.length === 0) {
       return undefined;
@@ -1021,7 +744,7 @@ export class PiProcessSession {
         }
 
         if (typeof image.path === "string" && image.path.length > 0) {
-          const buffer = await readFile(image.path);
+          const buffer = await readFile(image.path, { signal });
           return {
             type: "image" as const,
             data: buffer.toString("base64"),
@@ -1030,7 +753,7 @@ export class PiProcessSession {
         }
 
         if (typeof image.url === "string" && image.url.length > 0) {
-          const response = await fetch(image.url);
+          const response = await fetch(image.url, { ...(signal ? { signal } : {}) });
           if (!response.ok) {
             throw new Error(`Failed to fetch image: ${response.status} ${response.statusText}`);
           }
@@ -1048,36 +771,6 @@ export class PiProcessSession {
 
     return converted;
   }
-}
-
-function parseStateModelId(model: UpstreamModel | undefined): string | undefined {
-  if (!model) {
-    return undefined;
-  }
-  return normalizeModelKey(model.provider, model.id);
-}
-
-function parseStateModelContextWindow(model: UpstreamModel | undefined): number | null {
-  if (!model) {
-    return null;
-  }
-  return typeof model.contextWindow === "number" && Number.isFinite(model.contextWindow)
-    ? model.contextWindow
-    : null;
-}
-
-function isUpstreamModel(value: unknown): value is UpstreamModel {
-  return isRecord(value) && typeof value.provider === "string" && typeof value.id === "string";
-}
-
-function parseUpstreamModelFromResponse(value: unknown): UpstreamModel | undefined {
-  if (isRecord(value) && isUpstreamModel(value.model)) {
-    return value.model;
-  }
-  if (isUpstreamModel(value)) {
-    return value;
-  }
-  return undefined;
 }
 
 function normalizeElicitationResponse(

@@ -4,15 +4,30 @@
 
 ### Breaking Changes
 
+- Use the installed `pi` command instead of downloading the legacy Pi package at startup. Pi must already be installed and configured.
+- Require Node.js 22.22.1+, 24, or 26+ for the updated toolchain. Node 24 LTS is recommended.
+
 ### Added
+
+- Added opt-in installed-Pi smoke coverage using Luna 6 with low reasoning, separate from deterministic integration fixtures.
+- Added isolated adapter storage through `CODAPTER_STATE_DIR` and `CODAPTER_CONFIG_FILE`.
+- Added Linux ChatGPT Desktop launching and a portable bundled collaboration extension.
 
 ### Changed
 
 - Improved Pi model display names in the aggregated model list ([#9](https://github.com/kcosr/codapter/pull/9) by [@gustavonline](https://github.com/gustavonline))
+- Updated TypeScript to 7, Biome to 2, Vitest to 5, and reviewed runtime and build dependencies.
+- Separated CLI transports, Pi RPC lifecycle, history translation, model catalogs, and account state into focused owners.
+- Aligned bootstrap, model metadata, thread serialization, and native input handling with Codex app-server 0.159.3.
 
 ### Fixed
 
 - Fixed Pi thread cwd propagation so Pi sessions start, resume, and fork in the thread workspace instead of falling back to the backend default cwd ([#8](https://github.com/kcosr/codapter/pull/8) by [@IgorWarzocha](https://github.com/IgorWarzocha))
+- Preserved installed Pi wrappers, extensions, provider settings, and prompts. Applied reasoning effort through native RPC and waited for settled extension work before completing turns.
+- Translated Pi select, confirm, input, and editor dialogs into desktop questions and returned answers in Pi's native format.
+- Fixed partial-startup cleanup, idle reattachment, session-state write races, cancellation, and connected-listener shutdown.
+- Accepted current Desktop config arguments without replacing Pi extension settings or logging sensitive values.
+- Unified CLI and handshake versions under one release-owned constant.
 
 ### Removed
 

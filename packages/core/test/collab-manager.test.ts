@@ -1,10 +1,12 @@
 import { describe, expect, it, vi } from "vitest";
-import { BackendRouter } from "../src/backend-router.js";
-import { parseBackendModelId } from "../src/backend.js";
 import type { BackendAppServerEvent, BackendEvent, IBackend } from "../src/backend.js";
+import { parseBackendModelId } from "../src/backend.js";
+import { BackendRouter } from "../src/backend-router.js";
+import type {
+  CollabManagerCreateChildThreadInput,
+  CollabManagerNotificationSink,
+} from "../src/collab-manager.js";
 import { CollabManager } from "../src/collab-manager.js";
-import type { CollabManagerNotificationSink } from "../src/collab-manager.js";
-import type { CollabManagerCreateChildThreadInput } from "../src/collab-manager.js";
 
 class TestBackend implements IBackend {
   public readonly backendType: string;

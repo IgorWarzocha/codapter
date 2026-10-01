@@ -1,13 +1,20 @@
+import { AccountSession, type StoredAuthState } from "./account-session.js";
+import { type AppServerIdentity, createIdentity, resolveCodexHome } from "./app-server-identity.js";
+import { DebugLogWriter } from "./app-server-log.js";
+import {
+  readNativeSessionTurnIds,
+  readNativeSubAgentNickname,
+  readNativeSubAgentSessionMetadata,
+} from "./native-session.js";
+import { serializeThread, serializeTurn, serializeTurnNotification } from "./thread-protocol.js";
+
+export { readStoredAuthState, type StoredAuthState } from "./account-session.js";
+export type { AppServerIdentity } from "./app-server-identity.js";
+
 import { randomUUID } from "node:crypto";
-import { existsSync, readFileSync } from "node:fs";
-import { appendFile, mkdir } from "node:fs/promises";
 import { validateHeaderValue } from "node:http";
-import { homedir } from "node:os";
-import { dirname, resolve } from "node:path";
-import { BackendRouter, type RoutedBackendSelection } from "./backend-router.js";
 import type {
   BackendAppServerEvent,
-  BackendImageInput,
   BackendResolveServerRequestInput,
   BackendSessionLaunchConfig,
   BackendThreadReadResult,
@@ -15,6 +22,7 @@ import type {
   IBackend,
 } from "./backend.js";
 import { parseBackendModelId } from "./backend.js";
+import { BackendRouter, type RoutedBackendSelection } from "./backend-router.js";
 import {
   CollabManager,
   type CollabManagerCreateChildThreadInput,
@@ -24,22 +32,17 @@ import { CollabUdsListener } from "./collab-uds.js";
 import { CommandExecManager } from "./command-exec.js";
 import { InMemoryConfigStore } from "./config-store.js";
 import {
-  type JsonRpcEnvelope,
-  type JsonRpcMessage,
-  type JsonRpcResponse,
   failure,
   isJsonRpcNotification,
   isJsonRpcRequest,
   isJsonRpcResponse,
+  type JsonRpcEnvelope,
+  type JsonRpcMessage,
+  type JsonRpcResponse,
   success,
 } from "./jsonrpc.js";
 import type {
-  AccountLoginCompletedNotification,
-  AccountUpdatedNotification,
   AppListResponse,
-  AuthMode,
-  CancelLoginAccountParams,
-  CancelLoginAccountResponse,
   CollaborationModeListResponse,
   CommandExecParams,
   CommandExecResizeParams,
@@ -53,19 +56,13 @@ import type {
   ConfigValueWriteParams,
   ConfigWriteResponse,
   ExperimentalFeatureListResponse,
-  GetAccountRateLimitsResponse,
-  GetAccountResponse,
-  GetAuthStatusResponse,
   GitInfo,
   InitializeParams,
   InitializeResponse,
   JsonValue,
-  LoginAccountParams,
-  LoginAccountResponse,
-  LogoutAccountResponse,
   McpServerStatusListResponse,
+  ModelListParams,
   ModelListResponse,
-  PlanType,
   PluginListResponse,
   SandboxMode,
   SandboxPolicy,
@@ -112,7 +109,6 @@ const JSON_RPC_INVALID_PARAMS = -32602;
 const JSON_RPC_INTERNAL_ERROR = -32603;
 const JSON_RPC_NOT_INITIALIZED = -32002;
 const JSON_RPC_ALREADY_INITIALIZED = -32003;
-const ADAPTER_VERSION = "0.0.3";
 const DEFAULT_APPROVAL_POLICY = "never";
 const DEFAULT_APPROVALS_REVIEWER = "user";
 const DEFAULT_SANDBOX_MODE: SandboxMode = "workspace-write";
@@ -121,12 +117,6 @@ const INTERNAL_TITLE_THREAD_PROMPT_PREFIX =
   "You are a helpful assistant. You will be presented with a user prompt, and your job is to provide a short title for a task";
 const INTERNAL_TITLE_THREAD_PROMPT_MARKER = "Generate a concise UI title";
 const INTERNAL_TITLE_THREAD_PREVIEW_PREFIX = INTERNAL_TITLE_THREAD_PROMPT_PREFIX.slice(0, 120);
-
-export interface AppServerIdentity {
-  readonly userAgent: string;
-  readonly platformFamily: string;
-  readonly platformOs: string;
-}
 
 export interface AppServerLogger {
   warn(message: string, context?: Record<string, unknown>): void;
@@ -200,42 +190,6 @@ interface ThreadExecutionContext {
   readonly collaborationMode: JsonValue | null;
 }
 
-export type StoredAuthState =
-  | { mode: "apikey"; apiKey: string }
-  | {
-      mode: "chatgptAuthTokens";
-      accessToken: string;
-      accountId: string;
-      email: string | null;
-      planType: PlanType;
-    };
-
-function detectPlatformFamily(): string {
-  return process.platform === "win32" ? "windows" : "unix";
-}
-
-function detectPlatformOs(): string {
-  switch (process.platform) {
-    case "darwin":
-      return "macos";
-    case "win32":
-      return "windows";
-    default:
-      return "linux";
-  }
-}
-
-function readEmulatedIdentityFromToml(): string | null {
-  const filePath = resolve(process.cwd(), "codapter.toml");
-  if (!existsSync(filePath)) {
-    return null;
-  }
-
-  const raw = readFileSync(filePath, "utf8");
-  const match = raw.match(/^\s*emulateCodexIdentity\s*=\s*"([^"]+)"\s*$/m);
-  return match?.[1] ?? null;
-}
-
 function readStringRecordValue(record: unknown, key: string): string | null {
   if (typeof record !== "object" || record === null) {
     return null;
@@ -289,123 +243,6 @@ function rewriteCollaborationModeSettings(
   };
 }
 
-function createIdentity(): AppServerIdentity {
-  const userAgent =
-    process.env.CODAPTER_EMULATE_CODEX_IDENTITY ??
-    readEmulatedIdentityFromToml() ??
-    `codapter/${ADAPTER_VERSION}`;
-
-  return {
-    userAgent,
-    platformFamily: detectPlatformFamily(),
-    platformOs: detectPlatformOs(),
-  };
-}
-
-function normalizePlanType(value: unknown): PlanType {
-  const normalized = typeof value === "string" ? value.toLowerCase() : "";
-  switch (normalized) {
-    case "free":
-    case "go":
-    case "plus":
-    case "pro":
-    case "team":
-    case "business":
-    case "enterprise":
-    case "edu":
-    case "unknown":
-      return normalized as PlanType;
-    default:
-      return "unknown";
-  }
-}
-
-function decodeJwtPayload(token: string): Record<string, unknown> | null {
-  const segments = token.split(".");
-  if (segments.length < 2) {
-    return null;
-  }
-
-  const base64 = segments[1].replace(/-/g, "+").replace(/_/g, "/");
-  const padded = base64.padEnd(Math.ceil(base64.length / 4) * 4, "=");
-  try {
-    const parsed = JSON.parse(Buffer.from(padded, "base64").toString("utf8"));
-    return parsed && typeof parsed === "object" ? (parsed as Record<string, unknown>) : null;
-  } catch {
-    return null;
-  }
-}
-
-function extractChatgptIdentity(accessToken: string): { email: string | null; planType: PlanType } {
-  const payload = decodeJwtPayload(accessToken);
-  const profile =
-    payload?.profile && typeof payload.profile === "object"
-      ? (payload.profile as Record<string, unknown>)
-      : null;
-  const openaiProfile =
-    payload?.["https://api.openai.com/profile"] &&
-    typeof payload["https://api.openai.com/profile"] === "object"
-      ? (payload["https://api.openai.com/profile"] as Record<string, unknown>)
-      : null;
-  const authClaims =
-    payload?.["https://api.openai.com/auth"] &&
-    typeof payload["https://api.openai.com/auth"] === "object"
-      ? (payload["https://api.openai.com/auth"] as Record<string, unknown>)
-      : null;
-  const email =
-    typeof payload?.email === "string"
-      ? payload.email
-      : typeof openaiProfile?.email === "string"
-        ? openaiProfile.email
-        : typeof profile?.email === "string"
-          ? profile.email
-          : null;
-  return {
-    email,
-    planType: normalizePlanType(authClaims?.chatgpt_plan_type),
-  };
-}
-
-export function readStoredAuthState(): StoredAuthState | null {
-  const authPath = resolve(homedir(), ".codex", "auth.json");
-  if (!existsSync(authPath)) {
-    return null;
-  }
-
-  try {
-    const parsed = JSON.parse(readFileSync(authPath, "utf8"));
-    if (!isRecord(parsed)) {
-      return null;
-    }
-
-    const tokens = isRecord(parsed.tokens) ? parsed.tokens : null;
-    const accessToken = typeof tokens?.access_token === "string" ? tokens.access_token : null;
-    const accountId = typeof tokens?.account_id === "string" ? tokens.account_id : null;
-    if (accessToken && accountId) {
-      const identity = extractChatgptIdentity(accessToken);
-      return {
-        mode: "chatgptAuthTokens",
-        accessToken,
-        accountId,
-        email: identity.email,
-        planType: identity.planType,
-      };
-    }
-
-    const apiKey = typeof parsed.OPENAI_API_KEY === "string" ? parsed.OPENAI_API_KEY : null;
-    if (apiKey && apiKey.length > 0) {
-      return {
-        mode: "apikey",
-        apiKey,
-      };
-    }
-  } catch {
-    return null;
-  }
-
-  return null;
-}
-
 function buildSandboxPolicy(mode: SandboxMode | null | undefined, cwd: string): SandboxPolicy {
   switch (mode ?? DEFAULT_SANDBOX_MODE) {
     case "danger-full-access":
@@ -440,60 +277,6 @@ function defaultLogger(): AppServerLogger {
   };
 }
 
-interface DebugLogRecord {
-  readonly at: string;
-  readonly component: "app-server";
-  readonly kind: "startup" | "shutdown" | "backend-event" | "notification" | "state-transition";
-  readonly threadId?: string;
-  readonly turnId?: string;
-  readonly accepted?: boolean;
-  readonly method?: string;
-  readonly eventType?: string;
-  readonly payload?: unknown;
-  readonly diagnostics?: unknown;
-  readonly durationMs?: number;
-}
-
-class DebugLogWriter {
-  private pending: Promise<void> = Promise.resolve();
-  private failed = false;
-
-  constructor(
-    private readonly filePath: string,
-    private readonly logger: AppServerLogger
-  ) {}
-
-  async write(record: DebugLogRecord): Promise<void> {
-    if (this.failed) {
-      return;
-    }
-
-    const line = `${JSON.stringify(record)}\n`;
-    this.pending = this.pending.then(async () => {
-      await mkdir(dirname(this.filePath), { recursive: true });
-      await appendFile(this.filePath, line, "utf8");
-    });
-
-    try {
-      await this.pending;
-    } catch (error) {
-      this.failed = true;
-      this.logger.warn("Failed to write debug log", {
-        filePath: this.filePath,
-        error: error instanceof Error ? error.message : String(error),
-      });
-    }
-  }
-
-  async flush(): Promise<void> {
-    try {
-      await this.pending;
-    } catch {
-      // The logger already reported the failure path.
-    }
-  }
-}
-
 function truncateForLog(value: unknown, limit = 240): string {
   const serialized = JSON.stringify(value);
   if (serialized === undefined) {
@@ -503,10 +286,6 @@ function truncateForLog(value: unknown, limit = 240): string {
     return serialized;
   }
   return `${serialized.slice(0, limit)}...`;
-}
-
-function toUnixSeconds(isoTimestamp: string): number {
-  return Math.floor(new Date(isoTimestamp).getTime() / 1000);
 }
 
 function isInternalTitlePrompt(text: string): boolean {
@@ -534,13 +313,13 @@ function runtimeToThreadStatus(runtime: ThreadRuntime | undefined): ThreadStatus
   }
   switch (runtime.status) {
     case "turn_active":
-      return { type: "active", activeFlags: ["turn"] };
+      return { type: "active", activeFlags: [] };
     case "starting":
-      return { type: "active", activeFlags: ["starting"] };
+      return { type: "active", activeFlags: [] };
     case "forking":
-      return { type: "active", activeFlags: ["forking"] };
+      return { type: "active", activeFlags: [] };
     case "terminating":
-      return { type: "active", activeFlags: ["terminating"] };
+      return { type: "active", activeFlags: [] };
     default:
       return { type: "idle" };
   }
@@ -562,14 +341,6 @@ function threadSourceKinds(source: ThreadRegistryEntry["source"]): string[] {
   }
 
   return ["subAgent"];
-}
-
-function turnErrorFromUnknown(error: unknown) {
-  return {
-    message: error instanceof Error ? error.message : String(error),
-    codexErrorInfo: null,
-    additionalDetails: null,
-  };
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -617,7 +388,7 @@ export class AppServerConnection {
     string | number,
     PendingBackendServerRequest
   >();
-  private authState: StoredAuthState | null = null;
+  private readonly accountSession: AccountSession;
   private readonly state: ConnectionState = {
     initialized: false,
     initializedNotificationReceived: false,
@@ -648,7 +419,9 @@ export class AppServerConnection {
         await this.publish(notification.method, notification.params);
       },
     });
-    this.authState = options.initialAuthState ?? null;
+    this.accountSession = new AccountSession(options.initialAuthState ?? null, (method, params) =>
+      this.publish(method, params)
+    );
     if (this.collabEnabled) {
       const notifySink: CollabManagerNotificationSink = {
         notify: async (method, params, threadId) => {
@@ -775,17 +548,17 @@ export class AppServerConnection {
         case "configRequirements/read":
           return success(request.id, this.handleConfigRequirementsRead());
         case "account/read":
-          return success(request.id, this.handleAccountRead(request.params));
+          return success(request.id, this.accountSession.read(request.params));
         case "account/login/start":
-          return success(request.id, await this.handleAccountLoginStart(request.params));
+          return success(request.id, await this.accountSession.loginStart(request.params));
         case "account/login/cancel":
-          return success(request.id, this.handleAccountLoginCancel(request.params));
+          return success(request.id, this.accountSession.loginCancel(request.params));
         case "account/logout":
-          return success(request.id, await this.handleAccountLogout());
+          return success(request.id, await this.accountSession.logout());
         case "account/rateLimits/read":
-          return success(request.id, this.handleAccountRateLimitsRead());
+          return success(request.id, this.accountSession.rateLimits());
         case "getAuthStatus":
-          return success(request.id, this.handleGetAuthStatus(request.params));
+          return success(request.id, this.accountSession.authStatus(request.params));
         case "skills/list":
           return success(request.id, this.handleSkillsList());
         case "plugin/list":
@@ -793,7 +566,7 @@ export class AppServerConnection {
         case "app/list":
           return success(request.id, this.handleAppList(request.params));
         case "model/list":
-          return success(request.id, await this.handleModelList());
+          return success(request.id, await this.handleModelList(request.params));
         case "experimentalFeature/list":
           return success(request.id, this.handleExperimentalFeatureList(request.params));
         case "collaborationMode/list":
@@ -946,14 +719,7 @@ export class AppServerConnection {
 
     if (message.method === "initialized") {
       this.state.initializedNotificationReceived = true;
-      if (this.authState) {
-        void this.publishAccountLoginCompleted({
-          loginId: null,
-          success: true,
-          error: null,
-        });
-        void this.publishAccountUpdated();
-      }
+      void this.accountSession.initialized();
     }
 
     return null;
@@ -964,19 +730,12 @@ export class AppServerConnection {
       return failure(id, JSON_RPC_ALREADY_INITIALIZED, "Already initialized");
     }
 
-    const parsed = this.parseInitializeParams(params);
-
+    let parsed: InitializeParams;
     try {
+      parsed = this.parseInitializeParams(params);
       validateHeaderValue("x-codapter-client", parsed.clientInfo.name);
     } catch {
       return failure(id, JSON_RPC_INVALID_PARAMS, "Invalid initialize params");
-    }
-
-    if (parsed.clientInfo.version !== ADAPTER_VERSION) {
-      this.logger.warn("Client version differs from adapter version", {
-        clientVersion: parsed.clientInfo.version,
-        adapterVersion: ADAPTER_VERSION,
-      });
     }
 
     this.state.initialized = true;
@@ -987,6 +746,7 @@ export class AppServerConnection {
 
     const response: InitializeResponse = {
       userAgent: this.identity.userAgent,
+      codexHome: resolveCodexHome(),
       platformFamily: this.identity.platformFamily,
       platformOs: this.identity.platformOs,
     };
@@ -1109,132 +869,6 @@ export class AppServerConnection {
     return { requirements: null };
   }
 
-  private handleAccountRead(_params: unknown): GetAccountResponse {
-    const account =
-      this.authState?.mode === "apikey"
-        ? { type: "apiKey" as const }
-        : this.authState?.mode === "chatgptAuthTokens" && this.authState.email
-          ? {
-              type: "chatgpt" as const,
-              email: this.authState.email,
-              planType: this.authState.planType,
-            }
-          : null;
-    return {
-      account,
-      requiresOpenaiAuth: this.authState !== null,
-    };
-  }
-
-  private async handleAccountLoginStart(params: unknown): Promise<LoginAccountResponse> {
-    const parsed = params as LoginAccountParams;
-    switch (parsed?.type) {
-      case "apiKey":
-        this.authState = { mode: "apikey", apiKey: parsed.apiKey };
-        await this.publishAccountLoginCompleted({
-          loginId: null,
-          success: true,
-          error: null,
-        });
-        await this.publishAccountUpdated();
-        return { type: "apiKey" };
-      case "chatgptAuthTokens": {
-        const identity = extractChatgptIdentity(parsed.accessToken);
-        this.authState = {
-          mode: "chatgptAuthTokens",
-          accessToken: parsed.accessToken,
-          accountId: parsed.chatgptAccountId,
-          email: identity.email,
-          planType:
-            parsed.chatgptPlanType === null || parsed.chatgptPlanType === undefined
-              ? identity.planType
-              : normalizePlanType(parsed.chatgptPlanType),
-        };
-        await this.publishAccountLoginCompleted({
-          loginId: null,
-          success: true,
-          error: null,
-        });
-        await this.publishAccountUpdated();
-        return { type: "chatgptAuthTokens" };
-      }
-      case "chatgpt":
-        throw new Error(
-          "Interactive ChatGPT login is not supported by codapter; use chatgptAuthTokens instead."
-        );
-      default:
-        throw new Error("Invalid account/login/start params");
-    }
-  }
-
-  private handleAccountLoginCancel(params: unknown): CancelLoginAccountResponse {
-    const parsed = params as Partial<CancelLoginAccountParams>;
-    if (typeof parsed?.loginId !== "string") {
-      throw new Error("Invalid account/login/cancel params");
-    }
-    return { status: "notFound" };
-  }
-
-  private async handleAccountLogout(): Promise<LogoutAccountResponse> {
-    this.authState = null;
-    await this.publishAccountUpdated();
-    return {};
-  }
-
-  private handleAccountRateLimitsRead(): GetAccountRateLimitsResponse {
-    return {
-      rateLimits: {
-        limitId: null,
-        limitName: null,
-        primary: null,
-        secondary: null,
-        credits: null,
-        planType: null,
-      },
-      rateLimitsByLimitId: null,
-    };
-  }
-
-  private get effectiveAuthMode(): AuthMode | null {
-    if (!this.authState) {
-      return null;
-    }
-    return this.authState.mode === "chatgptAuthTokens" ? "chatgpt" : this.authState.mode;
-  }
-
-  private handleGetAuthStatus(params: unknown): GetAuthStatusResponse {
-    const parsed = (params ?? {}) as { includeToken?: boolean | null } | null;
-    const includeToken = Boolean(parsed?.includeToken);
-    const authToken =
-      !includeToken || !this.authState
-        ? null
-        : this.authState.mode === "apikey"
-          ? this.authState.apiKey
-          : this.authState.accessToken;
-    return {
-      authMethod: this.effectiveAuthMode,
-      authToken,
-      requiresOpenaiAuth: this.authState !== null,
-    };
-  }
-
-  private currentAccountUpdatedNotification(): AccountUpdatedNotification {
-    return {
-      authMode: this.effectiveAuthMode,
-      planType: this.authState?.mode === "chatgptAuthTokens" ? this.authState.planType : null,
-    };
-  }
-
-  private async publishAccountLoginCompleted(
-    payload: AccountLoginCompletedNotification
-  ): Promise<void> {
-    await this.publish("account/login/completed", payload);
-  }
-
-  private async publishAccountUpdated(): Promise<void> {
-    await this.publish("account/updated", this.currentAccountUpdatedNotification());
-  }
-
   private handleSkillsList(): SkillsListResponse {
     return { data: [] };
   }
@@ -1242,6 +876,8 @@ export class AppServerConnection {
   private handlePluginList(): PluginListResponse {
     return {
       marketplaces: [],
+      marketplaceLoadErrors: [],
+      featuredPluginIds: [],
       remoteSyncError: null,
     };
   }
@@ -1273,18 +909,31 @@ export class AppServerConnection {
     };
   }
 
-  private async handleModelList(): Promise<ModelListResponse> {
+  private async handleModelList(params: unknown): Promise<ModelListResponse> {
     const { models, diagnostics, totalDurationMs } = await this.backendRouter.listModelsDetailed();
+    const parsed = (params ?? {}) as Partial<ModelListParams>;
+    const visible = parsed.includeHidden ? models : models.filter((model) => !model.hidden);
+    const cursor = Number(parsed.cursor ?? 0);
+    const start = Number.isInteger(cursor) && cursor >= 0 ? cursor : 0;
+    const limit = parsed.limit ?? visible.length;
+    if (!Number.isInteger(limit) || limit < 0) throw new Error("Invalid model/list limit");
+    const page = visible.slice(start, start + limit);
 
     const response: ModelListResponse = {
-      data: models.map((model) => ({
+      data: page.map((model) => ({
         id: model.id,
         model: model.model,
-        upgrade: null,
-        upgradeInfo: null,
-        availabilityNux: null,
+        upgrade: model.upgrade ?? null,
+        upgradeInfo: model.upgradeInfo ?? null,
+        availabilityNux: model.availabilityNux ?? null,
         displayName: model.displayName,
         description: model.description,
+        modelSpecialty: model.modelSpecialty ?? null,
+        multiAgentVersion: model.multiAgentVersion ?? null,
+        additionalSpeedTiers: [...(model.additionalSpeedTiers ?? [])],
+        serviceTiers: [...(model.serviceTiers ?? [])],
+        defaultServiceTier: model.defaultServiceTier ?? null,
+        availableAccessPrograms: model.availableAccessPrograms ?? null,
         hidden: model.hidden,
         supportedReasoningEfforts: [...model.supportedReasoningEfforts],
         defaultReasoningEffort: model.defaultReasoningEffort,
@@ -1292,7 +941,7 @@ export class AppServerConnection {
         supportsPersonality: model.supportsPersonality,
         isDefault: model.isDefault,
       })),
-      nextCursor: null,
+      nextCursor: limit > 0 && start + limit < visible.length ? String(start + limit) : null,
     };
 
     void this.debugLogWriter?.write({
@@ -1428,8 +1077,6 @@ export class AppServerConnection {
     const collabRuntimeState = collabAgent
       ? (this.collabManager?.getAgentRuntimeStateByThreadId(parsed.threadId) ?? null)
       : null;
-    const needsCollabResume =
-      collabAgent?.status === "shutdown" || collabAgent?.status === "errored";
     const existing = this.threadRuntimes.get(parsed.threadId);
     const existingActiveTurnId = existing?.activeTurnId ?? null;
     const runtime = existing
@@ -1546,7 +1193,7 @@ export class AppServerConnection {
         collaborationMode: null,
       });
       await this.publishThreadStatus(parsed.threadId);
-      return await this.buildThreadExecutionResponse(
+      const response = await this.buildThreadExecutionResponse(
         thread,
         entry.model,
         entry.reasoningEffort,
@@ -1557,6 +1204,12 @@ export class AppServerConnection {
         parsed.sandbox ?? null,
         readResult.model ? effectiveReasoningEffort : effectiveReasoningEffort
       );
+      return {
+        ...response,
+        collaborationMode: null,
+        turnsBackwardsCursor: null,
+        itemsBackwardsCursor: null,
+      };
     } catch (error) {
       runtime.status = "terminating";
       runtime.readyResolver?.();
@@ -1628,6 +1281,8 @@ export class AppServerConnection {
       let entry = await this.threadRegistry.create({
         threadId: forkThreadId,
         backendSessionId: forked.threadHandle,
+        sessionId: sourceEntry.sessionId ?? sourceEntry.threadId,
+        forkedFromId: sourceEntry.threadId,
         backendType: sourceEntry.backendType,
         ephemeral,
         hidden: ephemeral,
@@ -1759,7 +1414,13 @@ export class AppServerConnection {
         }
         return !entry.archived;
       })
-      .filter((entry) => !parsed.cwd || entry.cwd === parsed.cwd)
+      .filter(
+        (entry) =>
+          !parsed.cwd ||
+          (Array.isArray(parsed.cwd)
+            ? parsed.cwd.includes(entry.cwd ?? "")
+            : entry.cwd === parsed.cwd)
+      )
       .filter((entry) =>
         !parsed.searchTerm
           ? true
@@ -1777,17 +1438,18 @@ export class AppServerConnection {
           ? true
           : parsed.modelProviders.includes(entry.modelProvider ?? DEFAULT_MODEL_PROVIDER)
       )
-      .sort((left, right) =>
-        (parsed.sortKey ?? "created_at") === "updated_at"
-          ? right.updatedAt.localeCompare(left.updatedAt)
-          : right.createdAt.localeCompare(left.createdAt)
-      );
+      .sort((left, right) => {
+        const key = parsed.sortKey === "updated_at" ? "updatedAt" : "createdAt";
+        const order = left[key].localeCompare(right[key]);
+        return parsed.sortDirection === "asc" ? order : -order;
+      });
 
     const start = Number.isFinite(cursor) && cursor >= 0 ? cursor : 0;
     const slice = visibleEntries.slice(start, start + limit);
     return {
       data: slice.map((entry) => this.buildThread(entry, [])),
       nextCursor: start + limit < visibleEntries.length ? String(start + limit) : null,
+      backwardsCursor: slice.length > 0 ? String(visibleEntries.length - 1 - start) : null,
     };
   }
 
@@ -2017,12 +1679,12 @@ export class AppServerConnection {
     }
 
     return {
-      turn: {
+      turn: serializeTurn({
         id: backendTurnId,
         status: "inProgress",
         error: null,
         items: [],
-      },
+      }),
     };
   }
 
@@ -2031,7 +1693,7 @@ export class AppServerConnection {
     const entry = await this.getThreadEntry(parsed.threadId);
     const backend = this.requireBackend(entry.backendType);
     const runtime = this.threadRuntimes.get(parsed.threadId);
-    if (!runtime || runtime.status !== "turn_active" || runtime.activeTurnId !== parsed.turnId) {
+    if (runtime?.status !== "turn_active" || runtime.activeTurnId !== parsed.turnId) {
       throw new Error(`No active turn ${parsed.turnId} for thread ${parsed.threadId}`);
     }
 
@@ -2200,7 +1862,7 @@ export class AppServerConnection {
     status: string;
   }): void {
     const runtime = this.threadRuntimes.get(agent.threadId);
-    if (!runtime || !runtime.managedByCollab) {
+    if (!runtime?.managedByCollab) {
       return;
     }
 
@@ -2229,37 +1891,13 @@ export class AppServerConnection {
     }
   }
 
-  private normalizeUserInputs(input: readonly UserInput[]): {
-    text: string;
-    images: BackendImageInput[];
-    preview: string;
-  } {
-    const textParts: string[] = [];
-    const images: BackendImageInput[] = [];
-
-    for (const item of input) {
-      switch (item.type) {
-        case "text":
-          textParts.push(item.text);
-          break;
-        case "image":
-          images.push({ type: "image", url: item.url });
-          break;
-        case "localImage":
-          images.push({ type: "localImage", path: item.path });
-          break;
-        case "skill":
-        case "mention":
-          throw new Error(`Unsupported user input type: ${item.type}`);
-      }
-    }
-
-    const text = textParts.join("\n").trim();
-    return {
-      text,
-      images,
-      preview: text.slice(0, 120),
-    };
+  private normalizeUserInputs(input: readonly UserInput[]): { text: string; preview: string } {
+    const text = input
+      .filter((item) => item.type === "text")
+      .map((item) => item.text)
+      .join("\n")
+      .trim();
+    return { text, preview: text.slice(0, 120) };
   }
 
   private applyGitInfoPatch(
@@ -2280,24 +1918,11 @@ export class AppServerConnection {
   }
 
   private buildThread(entry: ThreadRegistryEntry, turns: Turn[]): Thread {
-    return {
-      id: entry.threadId,
-      preview: entry.preview ?? "",
-      ephemeral: entry.ephemeral,
-      modelProvider: entry.modelProvider ?? entry.backendType ?? DEFAULT_MODEL_PROVIDER,
-      createdAt: toUnixSeconds(entry.createdAt),
-      updatedAt: toUnixSeconds(entry.updatedAt),
-      status: runtimeToThreadStatus(this.threadRuntimes.get(entry.threadId)),
-      path: entry.path,
-      cwd: entry.cwd ?? process.cwd(),
-      cliVersion: ADAPTER_VERSION,
-      source: "type" in entry.source ? "appServer" : entry.source,
-      agentNickname: entry.agentNickname,
-      agentRole: entry.agentRole,
-      gitInfo: entry.gitInfo,
-      name: entry.name,
-      turns,
-    };
+    return serializeThread(
+      entry,
+      runtimeToThreadStatus(this.threadRuntimes.get(entry.threadId)),
+      turns
+    );
   }
 
   private recordThreadExecutionContext(threadId: string, context: ThreadExecutionContext): void {
@@ -2328,7 +1953,9 @@ export class AppServerConnection {
       thread,
       model: requestedModel ?? persistedModel ?? defaultModel?.model ?? "unknown::default",
       modelProvider: thread.modelProvider,
-      serviceTier: null,
+      serviceTier: this.threadExecutionContexts.get(thread.id)?.serviceTier ?? null,
+      disabledPluginIds: [],
+      instructionSources: [],
       cwd,
       approvalPolicy: requestedApprovalPolicy ?? DEFAULT_APPROVAL_POLICY,
       approvalsReviewer: requestedApprovalsReviewer ?? DEFAULT_APPROVALS_REVIEWER,
@@ -2378,7 +2005,7 @@ export class AppServerConnection {
         throw error;
       }
       const codexBackend = this.backendRouter.getBackend("codex");
-      if (!codexBackend || !codexBackend.isAlive()) {
+      if (!codexBackend?.isAlive()) {
         throw error;
       }
       return {
@@ -2424,143 +2051,12 @@ export class AppServerConnection {
     return rewritten;
   }
 
-  private readNativeSubAgentNickname(
-    parentPath: string | null,
-    toolCallId: string,
-    backendThreadId: string
-  ): string | null {
-    if (!parentPath) {
-      return null;
-    }
-
-    try {
-      const lines = readFileSync(parentPath, "utf8")
-        .split("\n")
-        .map((line) => line.trim())
-        .filter((line) => line.length > 0);
-      for (let index = lines.length - 1; index >= 0; index -= 1) {
-        const parsed = JSON.parse(lines[index] ?? "");
-        if (
-          !isRecord(parsed) ||
-          parsed.type !== "response_item" ||
-          !isRecord(parsed.payload) ||
-          parsed.payload.type !== "function_call_output" ||
-          parsed.payload.call_id !== toolCallId ||
-          typeof parsed.payload.output !== "string"
-        ) {
-          continue;
-        }
-        const output = JSON.parse(parsed.payload.output);
-        if (!isRecord(output) || output.agent_id !== backendThreadId) {
-          continue;
-        }
-        return typeof output.nickname === "string" && output.nickname.length > 0
-          ? output.nickname
-          : null;
-      }
-    } catch {
-      return null;
-    }
-
-    return null;
-  }
-
-  private readNativeSubAgentSessionMetadata(sessionPath: string | null): {
-    agentNickname: string | null;
-    agentRole: string | null;
-  } | null {
-    if (!sessionPath) {
-      return null;
-    }
-
-    try {
-      const lines = readFileSync(sessionPath, "utf8")
-        .split("\n")
-        .map((line) => line.trim())
-        .filter((line) => line.length > 0);
-      for (const line of lines) {
-        const parsed = JSON.parse(line);
-        if (!isRecord(parsed) || parsed.type !== "session_meta" || !isRecord(parsed.payload)) {
-          continue;
-        }
-
-        const payload = parsed.payload;
-        const subagent =
-          isRecord(payload.source) && isRecord(payload.source.subagent)
-            ? payload.source.subagent
-            : null;
-        const threadSpawn =
-          subagent && isRecord(subagent.thread_spawn) ? subagent.thread_spawn : null;
-        return {
-          agentNickname:
-            typeof payload.agent_nickname === "string"
-              ? payload.agent_nickname
-              : typeof threadSpawn?.agent_nickname === "string"
-                ? threadSpawn.agent_nickname
-                : null,
-          agentRole:
-            typeof payload.agent_role === "string"
-              ? payload.agent_role
-              : typeof threadSpawn?.agent_role === "string"
-                ? threadSpawn.agent_role
-                : null,
-        };
-      }
-    } catch {
-      return null;
-    }
-
-    return null;
-  }
-
-  private readNativeSessionTurnIds(sessionPath: string | null): string[] | null {
-    if (!sessionPath) {
-      return null;
-    }
-
-    try {
-      const turnIds: string[] = [];
-      const seen = new Set<string>();
-      const lines = readFileSync(sessionPath, "utf8")
-        .split("\n")
-        .map((line) => line.trim())
-        .filter((line) => line.length > 0);
-      for (const line of lines) {
-        const parsed = JSON.parse(line);
-        if (!isRecord(parsed)) {
-          continue;
-        }
-
-        let turnId: string | null = null;
-        if (parsed.type === "turn_context" && isRecord(parsed.payload)) {
-          turnId = typeof parsed.payload.turn_id === "string" ? parsed.payload.turn_id : null;
-        } else if (
-          parsed.type === "event_msg" &&
-          isRecord(parsed.payload) &&
-          parsed.payload.type === "task_started"
-        ) {
-          turnId = typeof parsed.payload.turn_id === "string" ? parsed.payload.turn_id : null;
-        }
-
-        if (!turnId || seen.has(turnId)) {
-          continue;
-        }
-        seen.add(turnId);
-        turnIds.push(turnId);
-      }
-
-      return turnIds;
-    } catch {
-      return null;
-    }
-  }
-
   private normalizeReadTurns(entry: ThreadRegistryEntry, turns: Turn[]): Turn[] {
     if (entry.backendType !== "codex" || turns.length === 0) {
       return turns;
     }
 
-    const sessionTurnIds = this.readNativeSessionTurnIds(entry.path);
+    const sessionTurnIds = readNativeSessionTurnIds(entry.path);
     if (!sessionTurnIds || sessionTurnIds.length === 0) {
       return turns;
     }
@@ -2656,7 +2152,7 @@ export class AppServerConnection {
     const backendThread = params.thread;
     const path = typeof backendThread.path === "string" ? backendThread.path : entry.path;
     const cwd = typeof backendThread.cwd === "string" ? backendThread.cwd : entry.cwd;
-    const sessionMetadata = this.readNativeSubAgentSessionMetadata(path);
+    const sessionMetadata = readNativeSubAgentSessionMetadata(path);
     const agentNickname = sessionMetadata?.agentNickname ?? entry.agentNickname;
     const agentRole = sessionMetadata?.agentRole ?? entry.agentRole;
     const backendName =
@@ -2716,7 +2212,7 @@ export class AppServerConnection {
     const path = readResult.path === undefined ? entry.path : readResult.path;
     const cwd = readResult.cwd ?? entry.cwd;
     const sessionMetadata =
-      entry.backendType === "codex" ? this.readNativeSubAgentSessionMetadata(path) : null;
+      entry.backendType === "codex" ? readNativeSubAgentSessionMetadata(path) : null;
     const preserveExistingSubAgentIdentity = isSubAgentThreadSource(entry.source);
     const readAgentNickname =
       readResult.agentNickname === null && preserveExistingSubAgentIdentity
@@ -2819,13 +2315,10 @@ export class AppServerConnection {
         continue;
       }
 
-      const nickname = this.readNativeSubAgentNickname(
-        parentEntry.path,
-        toolCallId,
-        backendThreadId
-      );
+      const nickname = readNativeSubAgentNickname(parentEntry.path, toolCallId, backendThreadId);
       const entry = await this.threadRegistry.create({
         backendSessionId: backendThreadId,
+        sessionId: parentEntry.sessionId ?? parentEntry.threadId,
         backendType: parentEntry.backendType,
         path: null,
         cwd: parentEntry.cwd ?? process.cwd(),
@@ -2927,6 +2420,9 @@ export class AppServerConnection {
     params: unknown
   ): Promise<unknown> {
     let rewritten = this.rewriteBackendThreadReferences(threadId, threadHandle, params);
+    if (method === "turn/started" || method === "turn/completed") {
+      rewritten = serializeTurnNotification(rewritten);
+    }
     const entry = await this.threadRegistry.get(threadId);
 
     if (
@@ -3171,6 +2667,7 @@ export class AppServerConnection {
     const entry = await this.threadRegistry.create({
       threadId: input.threadId,
       backendSessionId: input.threadHandle,
+      sessionId: parentEntry.sessionId ?? parentEntry.threadId,
       backendType: input.backendType,
       path: input.path,
       cwd: parentEntry.cwd ?? process.cwd(),

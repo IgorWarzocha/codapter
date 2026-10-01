@@ -13,11 +13,7 @@ interface IndexedAggregatedModelEntry extends AggregatedModelEntry {
 }
 
 function cloneModel(model: BackendModelSummary): BackendModelSummary {
-  return {
-    ...model,
-    inputModalities: [...model.inputModalities],
-    supportedReasoningEfforts: [...model.supportedReasoningEfforts],
-  };
+  return structuredClone(model);
 }
 
 function cloneModelListResult(result: BackendModelListResult): BackendModelListResult {

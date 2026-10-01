@@ -6,7 +6,8 @@ import { describe, expect, it } from "vitest";
 import { createCodexBackend } from "../src/index.js";
 
 async function createMockCodexScript(
-  rootDir: string
+  rootDir: string,
+  modelPages?: readonly { data: unknown[]; nextCursor: string | null }[]
 ): Promise<{ scriptPath: string; requestsPath: string }> {
   const scriptPath = join(rootDir, "mock-codex-app-server.mjs");
   const requestsPath = join(rootDir, "requests.jsonl");
@@ -16,6 +17,7 @@ async function createMockCodexScript(
     "const decoder = new StringDecoder('utf8');",
     "let buffer = '';",
     `const requestsPath = ${JSON.stringify(requestsPath)};`,
+    `const modelPages = ${JSON.stringify(modelPages ?? null)};`,
     "",
     "function write(value) {",
     "  process.stdout.write(JSON.stringify(value) + '\\n');",
@@ -32,6 +34,7 @@ async function createMockCodexScript(
     "    return;",
     "  }",
     "  if (payload.method === 'model/list') {",
+    "    if (modelPages) { write({ id: payload.id, result: modelPages[Number(payload.params?.cursor ?? 0)] }); return; }",
     "    write({ id: payload.id, result: { data: [{ id: 'gpt-5.4', model: 'gpt-5.4', displayName: 'GPT-5.4', description: 'mock', hidden: false, isDefault: true, inputModalities: ['text'], supportedReasoningEfforts: [{ reasoningEffort: 'medium', description: 'Balanced' }], defaultReasoningEffort: 'medium', supportsPersonality: true }] } });",
     "    return;",
     "  }",
@@ -159,6 +162,74 @@ async function waitFor(predicate: () => boolean, timeoutMs = 1500): Promise<void
 }
 
 describe("CodexBackend", () => {
+  it("loads all current catalog pages without dropping desktop capabilities", async () => {
+    const root = await mkdtemp(join(tmpdir(), "codapter-codex-catalog-"));
+    const nativeModel = {
+      id: "catalog-model",
+      model: "catalog-model",
+      displayName: "Catalog model",
+      description: "Fixture",
+      hidden: false,
+      isDefault: true,
+      inputModalities: ["text", "image"],
+      supportedReasoningEfforts: [],
+      defaultReasoningEffort: "low",
+      supportsPersonality: false,
+      modelSpecialty: "coding",
+      upgrade: "next-model",
+      upgradeInfo: { model: "next-model", upgradeCopy: "Upgrade" },
+      availabilityNux: { message: "Available" },
+      multiAgentVersion: "v2",
+      additionalSpeedTiers: ["fast"],
+      serviceTiers: [{ id: "fast", name: "Fast", description: "Faster" }],
+      defaultServiceTier: "fast",
+      availableAccessPrograms: { cyber: ["standard", "daybreakBlue"] },
+    };
+    const { scriptPath, requestsPath } = await createMockCodexScript(root, [
+      { data: [nativeModel], nextCursor: "1" },
+      {
+        data: [{ ...nativeModel, id: "hidden-model", model: "hidden-model", hidden: true }],
+        nextCursor: null,
+      },
+    ]);
+    const backend = createCodexBackend({ command: "node", args: [scriptPath] });
+    try {
+      await backend.initialize();
+      const models = await backend.listModels();
+      expect(models).toHaveLength(2);
+      expect(models[0]).toEqual(nativeModel);
+      expect(models[1].hidden).toBe(true);
+      const requests = (await readFile(requestsPath, "utf8"))
+        .trim()
+        .split("\n")
+        .map((line) => JSON.parse(line));
+      expect(
+        requests
+          .filter((request) => request.method === "model/list")
+          .map((request) => request.params)
+      ).toEqual([
+        { cursor: null, includeHidden: true },
+        { cursor: "1", includeHidden: true },
+      ]);
+    } finally {
+      await backend.dispose();
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it("rejects a repeated native catalog cursor instead of hanging discovery", async () => {
+    const root = await mkdtemp(join(tmpdir(), "codapter-codex-catalog-"));
+    const { scriptPath } = await createMockCodexScript(root, [{ data: [], nextCursor: "0" }]);
+    const backend = createCodexBackend({ command: "node", args: [scriptPath] });
+    try {
+      await backend.initialize();
+      await expect(backend.listModels()).rejects.toThrow("repeated a cursor");
+    } finally {
+      await backend.dispose();
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
   it("proxies stdio app-server requests and relays notifications/server requests", async () => {
     const root = await mkdtemp(join(tmpdir(), "codapter-codex-test-"));
     const { scriptPath: mockScript } = await createMockCodexScript(root);

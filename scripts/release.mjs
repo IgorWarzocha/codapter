@@ -43,7 +43,7 @@ function run(command, options = {}) {
       cwd: root,
       ...options,
     });
-  } catch (error) {
+  } catch {
     if (!options.ignoreError) {
       console.error(`Command failed: ${command}`);
       process.exit(1);
@@ -110,6 +110,12 @@ function bumpVersion(type) {
 
   const newVersion = `${major}.${minor}.${patch}`;
 
+  const versionPath = join(root, "packages", "core", "src", "version.ts");
+  const source = readFileSync(versionPath, "utf8");
+  if (!/^export const ADAPTER_VERSION = "[^"]+";$/m.test(source)) {
+    throw new Error("Cannot locate ADAPTER_VERSION in packages/core/src/version.ts");
+  }
+
   pkg.version = newVersion;
   writeFileSync(packageJsonPath, `${JSON.stringify(pkg, null, 2)}\n`, "utf8");
 
@@ -123,19 +129,14 @@ function bumpVersion(type) {
     writeFileSync(lockPath, `${JSON.stringify(lock, null, 2)}\n`, "utf8");
   }
 
-  // Update the VERSION constant in the CLI source
-  const cliIndexPath = join(root, "packages", "cli", "src", "index.ts");
-  if (existsSync(cliIndexPath)) {
-    const cliSource = readFileSync(cliIndexPath, "utf8");
-    const updated = cliSource.replace(
-      /^const VERSION = ".*";$/m,
-      `const VERSION = "${newVersion}";`
-    );
-    if (updated !== cliSource) {
-      writeFileSync(cliIndexPath, updated, "utf8");
-      console.log("  Updated VERSION in packages/cli/src/index.ts");
-    }
-  }
+  writeFileSync(
+    versionPath,
+    source.replace(
+      /^export const ADAPTER_VERSION = "[^"]+";$/m,
+      `export const ADAPTER_VERSION = "${newVersion}";`
+    ),
+    "utf8"
+  );
 
   console.log(`  Version: ${current} -> ${newVersion}`);
   return newVersion;
@@ -237,7 +238,7 @@ updateChangelogForRelease(version);
 console.log();
 
 console.log("Committing and tagging...");
-run("git add CHANGELOG.md package.json package-lock.json packages/cli/src/index.ts");
+run("git add CHANGELOG.md package.json package-lock.json packages/core/src/version.ts");
 run(`git commit -m "Release v${version}"`);
 run(`git tag v${version}`);
 console.log();

@@ -1,474 +1,118 @@
 # Codapter
 
-> **WIP / Prototype** — This project is an early-stage proof of concept. APIs, configuration, and behavior may change without notice. Not recommended for production use.
+Use your installed [Pi coding agent](https://github.com/earendil-works/pi) through ChatGPT Desktop or another Codex app-server client. Codapter translates the protocol. Pi keeps its own tools, providers, prompts, skills, and extensions.
 
-A protocol adapter that lets clients built around the Codex app-server protocol — including [Codex Desktop](https://developers.openai.com/codex/app), the Codex CLI, and third-party applications — work with alternative AI backends. There are a growing number of well-built clients that speak this protocol; codapter lets you plug any of them into supported alternative backends.
+This is an experimental adapter, not a replacement for Pi or a complete implementation of every ChatGPT Desktop feature. The GUI is a client, not an extension manager.
 
 ![Codapter running inside Codex Desktop](docs/images/codex-desktop-example.png)
 
-*Codex Desktop connected through codapter via routed backends.*
+## Start
 
-**Supported backends in this branch**:
-- [Pi](https://github.com/badlogic/pi-mono) (`@mariozechner/pi-coding-agent`) with multi-provider LLM support.
-- Codex app-server proxy backend over stdio.
-- Backends are registered at startup by the CLI bootstrap. In this branch, Pi is required at startup and Codex is optional (disabled by `CODAPTER_CODEX_DISABLE` or skipped if unavailable).
+You need Node.js 24 LTS, an installed and configured `pi` command, and ChatGPT Desktop. Node 22.22.1+ and 26+ are also supported. Native Codex routing is optional and uses an installed `codex` command.
 
-**Codex websocket status**: websocket transport for the Codex backend is intentionally deferred in this topic. Current behavior is deterministic reject when `CODAPTER_CODEX_TRANSPORT=websocket` is selected. The next extension target is Codex backend websocket support.
-
-## How It Works
-
-Codapter implements the Codex app-server JSON-RPC protocol — the wire protocol that Codex Desktop and other clients use to communicate with a backend. Clients connect to codapter over stdio (local) or WebSocket (remote), and codapter translates every request into the target backend's native protocol.
-
-```mermaid
-graph TB
-    GUI["Codex Desktop GUI<br/>(unmodified Electron app)"]
-
-    subgraph Codapter
-        Transport["Transport Layer<br/>stdio / WebSocket TCP / WebSocket UDS"]
-        AppServer["App Server<br/>JSON-RPC dispatch + publish"]
-        Router["BackendRouter<br/>model aggregation + routing"]
-        Registry["Thread Registry<br/>persistent thread metadata"]
-        ConfigStore["Config Store<br/>persistent settings"]
-        CmdExec["Command Exec<br/>adapter-native shell"]
-    end
-
-    subgraph Backends["Registered Backends"]
-        PiBackend["Pi Backend<br/>IBackend implementation"]
-        PiProc["Pi subprocesses"]
-        CodexBackend["Codex Backend<br/>IBackend implementation"]
-        CodexProc["codex app-server subprocess"]
-    end
-
-    GUI -->|"JSON-RPC<br/>NDJSON / WebSocket"| Transport
-    Transport --> AppServer
-    AppServer --> Router
-    AppServer --> Registry
-    AppServer --> ConfigStore
-    AppServer --> CmdExec
-    Router --> PiBackend
-    Router --> CodexBackend
-    PiBackend --> PiProc
-    CodexBackend --> CodexProc
-```
-
-## Quick Start
-
-### Prerequisites
-
-- **Node.js 22+** ([download](https://nodejs.org/))
-- **Codex Desktop** installed ([download](https://developers.openai.com/codex/app))
-- **[Pi coding agent](https://github.com/badlogic/pi-mono)** installed and configured with at least one LLM provider (see Pi documentation for setup)
-
-### 1. Install & Build Codapter
-
-```bash
-git clone <repo-url> codapter
-cd codapter
+```sh
 npm install
 npm run build:dist
+./scripts/codapter.sh
 ```
 
-### 2. Run Locally
+Quit an existing desktop instance before launching, so it cannot reuse its previous backend. On Linux the launcher uses `chatgpt` from PATH. On macOS it checks the ChatGPT and Codex application bundles. Set `CODAPTER_DESKTOP_COMMAND` to use another executable.
 
-Point Codex Desktop at codapter:
+Select a **Pi** model in the desktop model picker. Pi model IDs look like `pi::openai-codex/gpt-6-luna`. Unprefixed model IDs route to native Codex, not Pi.
 
-```bash
-export CODEX_CLI_PATH="$(pwd)/dist/codapter.mjs"
-# Launch Codex Desktop — it will use codapter instead of the official CLI
-```
+The launcher prints its traffic-log path. It does not change your Pi configuration, enable extra collaboration tools, clear your threads, or expose a debugging port. To compare against native Codex, quit the app and run `./scripts/codex.sh`.
 
-Or run codapter directly for testing:
+To connect another client directly:
 
-```bash
-# Stdio mode (how Codex Desktop spawns it)
+```sh
 node dist/codapter.mjs app-server
-
-# Stdio mode with collab sub-agent support enabled via env var
-CODAPTER_COLLAB=1 node dist/codapter.mjs app-server
-
-# WebSocket mode (for remote connections)
-node dist/codapter.mjs app-server --listen ws://127.0.0.1:9234
-
-# Unix domain socket mode (for containerized environments)
-node dist/codapter.mjs app-server --listen unix:///tmp/codapter.sock
-
-# Multiple listeners simultaneously
-node dist/codapter.mjs app-server \
-  --listen ws://127.0.0.1:9234 \
-  --listen unix://$HOME/.codex/adapter.sock
 ```
 
-### Build Distribution Binary
+For your own desktop launcher, set `CODEX_CLI_PATH` to the absolute path of `dist/codapter.mjs` and `CODEX_APP_SERVER_FORCE_CLI=1` before launching the app.
 
-```bash
-npm run build:dist
-# Builds all packages and creates dist/codapter.mjs
-```
+## Your Pi setup stays in Pi
 
-## Architecture
+The default subprocess is `pi --mode rpc`. PATH wrappers are respected, including custom skill loading. Codapter does not download another Pi package or inject `--no-extensions`. Pi reads its normal agent directory, provider authentication, project instructions, and installed extensions.
 
-### Transport Layer
+- Extension tools and hooks run inside the native Pi session.
+- Model selection and reasoning effort are applied through Pi RPC.
+- Pi select, confirm, input, and editor dialogs are translated to desktop user-input requests.
+- Turns finish at Pi's `agent_settled` event, after extension follow-ups and recovery have finished.
+- Native Pi sessions remain the source of conversation history.
 
-Codapter supports three transport modes, all serving the same JSON-RPC protocol:
+Pi RPC cannot render custom terminal UI, keybindings, terminal widgets, or themes. Those features remain TUI-only. Desktop skill and plugin listings are not an inventory of your Pi extensions. An empty listing does not disable them.
 
-| Mode | Flag | Use Case |
-|------|------|----------|
-| **stdio** | *(default, no flag)* | Local mode — Codex Desktop spawns codapter as a child process |
-| **WebSocket/TCP** | `--listen ws://host:port` | Remote mode — SSH tunnel to this endpoint |
-| **WebSocket/UDS** | `--listen unix:///path/to/sock` | Container mode — SSH streamlocal forwarding |
+Codapter's optional `--collab` extension adds adapter-managed child threads. It is separate from any sub-agent extension you already use in Pi, and is off by default. Native Pi sub-agent tools remain native.
 
-The `CODAPTER_LISTEN` environment variable can be used instead of `--listen` flags (comma-separated for multiple listeners).
-
-All WebSocket listeners serve the root `/` endpoint. Health checks are available at `/healthz` and `/readyz`.
-
-### Request Lifecycle
-
-Current routed lifecycle:
-
-1. Client initializes the app-server connection (`initialize`, `initialized`).
-2. `model/list` is aggregated across healthy registered backends (`BackendRouter`).
-3. `thread/start` resolves the selected backend from the chosen model id. Pi models remain prefixed (`pi::...`); unprefixed ids route to Codex, and legacy `codex::...` ids are still accepted.
-4. Thread metadata is stored in the registry with `{ backendType, backendSessionId }`.
-5. `turn/start` routes to the owning backend thread handle.
-6. Backend notifications/server-requests are relayed to the client through `AppServerConnection`.
-
-### Thread & Session Model
-
-Codapter maintains a **thread registry** as the single source of truth for thread identity and metadata.
-
-**Storage**: `~/.local/share/codapter/threads.json` (atomic writes via temp file + rename)
-
-**Key behaviors**:
-- `thread/list` reads exclusively from the registry — never from the backend
-- `thread/start` creates both a registry entry and an owning backend thread handle
-- `thread/resume` reattaches using persisted `{ backendType, backendSessionId }`
-- `thread/fork` creates a new registry entry and backend-owned forked thread handle
-- `thread/archive` marks the thread in the registry and disposes the backend process
-
-Detailed current architecture and contract docs live in:
-- `docs/architecture.md`
-- `docs/backend-interface.md`
-- `docs/api-mapping.md`
-
-### Command Execution
-
-Standalone shell commands (`command/exec`) are handled **natively by the adapter** using Node.js `child_process`, not routed through the backend. This avoids blocking the backend's single-threaded session.
-
-| Method | Description |
-|--------|-------------|
-| `command/exec` | Spawn process, buffer or stream output |
-| `command/exec/write` | Write to process stdin (base64 encoded) |
-| `command/exec/terminate` | Kill process with SIGTERM |
-
-Output is capped at 1MB per stream by default (configurable via `outputBytesCap`). Streaming mode (`streamStdoutStderr: true`) sends `command/exec/outputDelta` notifications as data arrives.
-
-> **Note**: PTY/TTY mode (`tty: true`) is not supported. The Codex Desktop GUI does not appear to use this mode.
+**Trust boundary:** Pi tools keep their existing host permissions. Desktop sandbox and approval labels do not create a sandbox around Pi. Adapter-native `command/exec` also runs on the host. Use only trusted local clients or an authenticated SSH tunnel.
 
 ## Configuration
 
-### Environment Variables
+| Variable | Purpose | Default |
+| --- | --- | --- |
+| `CODAPTER_PI_COMMAND` | Pi executable, including a configured wrapper | `pi` |
+| `CODAPTER_PI_ARGS` | JSON array of launch arguments | `["--mode","rpc"]` |
+| `CODAPTER_PI_DISABLE` | Disable Pi registration | `0` |
+| `CODAPTER_PI_IDLE_TIMEOUT_MS` | Stop idle Pi processes, `0` disables | `300000` |
+| `CODAPTER_CODEX_DISABLE` | Disable optional native Codex routing | `0` |
+| `CODAPTER_CODEX_COMMAND` | Native Codex executable | `codex` |
+| `CODAPTER_CODEX_ARGS` | JSON array of native Codex arguments | `["app-server"]` |
+| `CODAPTER_STATE_DIR` | Thread registry and Pi session storage | `~/.local/share/codapter` |
+| `CODAPTER_CONFIG_FILE` | Adapter settings file | `~/.config/codapter/config.toml` |
+| `CODAPTER_LISTEN` | Comma-separated listener URIs | stdio |
+| `CODAPTER_COLLAB` | Enable adapter-managed sub-agents | `0` |
+| `CODAPTER_COLLAB_EXTENSION_PATH` | Override the bundled collaboration extension | bundled sibling |
+| `CODAPTER_DEBUG_LOG_FILE` | Optional detailed JSONL trace | disabled |
+| `CODAPTER_DESKTOP_COMMAND` | Desktop executable for launcher scripts | platform detection |
+| `TAP_LOG` | Desktop traffic log | private runtime directory |
 
-| Variable | Description | Default |
-|----------|-------------|---------|
-| `CODEX_CLI_PATH` | Set this to codapter's path so Codex Desktop uses it | — |
-| `CODAPTER_LISTEN` | Comma-separated listener URIs (alternative to `--listen`) | *(stdio)* |
-| `CODAPTER_COLLAB` | Enable collab sub-agent support (alternative to `--collab`) | *(disabled)* |
-| `CODAPTER_PI_COMMAND` | Override the command used to launch Pi | `npx` |
-| `CODAPTER_PI_ARGS` | Override Pi launch args (JSON array string); `--session-dir` is always appended | `["--yes","@mariozechner/pi-coding-agent","--mode","rpc"]` |
-| `CODAPTER_PI_IDLE_TIMEOUT_MS` | Idle timeout before Pi processes are gracefully stopped (ms; 0 disables) | `300000` (5 min) |
-| `CODAPTER_CODEX_DISABLE` | Disable Codex backend registration at startup (`1`, `true`, `yes`, `on`) | *(enabled)* |
-| `CODAPTER_CODEX_COMMAND` | Override the command used to launch Codex app-server | `codex` |
-| `CODAPTER_CODEX_ARGS` | Override Codex launch args (JSON array string) | `["app-server"]` |
-| `CODAPTER_CODEX_TRANSPORT` | Codex backend transport (`stdio` or `websocket`) | `stdio` |
-| `CODAPTER_CODEX_WS_URL` | Codex websocket URL when websocket transport is selected | *(none)* |
-| `CODAPTER_EMULATE_CODEX_IDENTITY` | User agent string returned in `initialize` | `codapter/<ADAPTER_VERSION>` |
-| `CODAPTER_COLLAB_EXTENSION_PATH` | Override path to the collab extension script | *(built-in)* |
-| `CODAPTER_DEBUG_LOG_FILE` | Path to JSONL debug log file | *(disabled)* |
+Pi authentication stays in Pi's agent directory. Codapter stores thread metadata and session files separately. Use one adapter process per state directory. Concurrent independent writers are not locked.
 
-### Config Store
+To select Luna 6 with low reasoning at process startup:
 
-The adapter maintains a config store that responds to `config/read` and `config/value/write` RPCs. Values are persisted to `~/.config/codapter/config.toml`, so settings like model selection and reasoning effort survive adapter restarts.
-
-### Pi Backend Configuration
-
-The Pi backend uses its own configuration at `~/.pi/agent/`:
-- **API keys**: `~/.pi/agent/auth.json`
-- **Sessions**: managed under `~/.local/share/codapter/backend-pi/`
-- **Model selection**: all models configured in Pi are exposed through `model/list`
-
-## Supported Codex RPC Methods
-
-### Fully Implemented
-
-| Method | Description |
-|--------|-------------|
-| `initialize` | Connection handshake with capabilities negotiation |
-| `thread/start` | Create new conversation thread |
-| `thread/resume` | Reconnect to existing thread |
-| `thread/fork` | Clone thread at current state |
-| `thread/read` | Read thread metadata and turn history |
-| `thread/list` | List threads with filtering and pagination |
-| `thread/loaded/list` | List currently loaded (active process) threads |
-| `thread/name/set` | Rename a thread |
-| `thread/archive` / `thread/unarchive` | Archive management |
-| `thread/metadata/update` | Update git info |
-| `thread/unsubscribe` | Stop notifications for a thread |
-| `turn/start` | Send user message, stream response |
-| `turn/interrupt` | Cancel in-progress turn |
-| `model/list` | List available models from backend |
-| `config/read` | Read adapter configuration |
-| `config/value/write` / `config/batchWrite` | Write configuration (persisted to disk) |
-| `configRequirements/read` | Returns null (no requirements) |
-| `getAuthStatus` / `account/read` | Returns current adapter auth state (null, API key, or ChatGPT token identity) |
-| `command/exec` | Execute shell commands (adapter-native) |
-| `command/exec/write` | Write to process stdin |
-| `command/exec/terminate` | Kill running process |
-| `command/exec/resize` | Resize terminal (returns unsupported error without PTY) |
-| `account/login/start` | API key or ChatGPT token login |
-| `account/login/cancel` | Cancel login flow |
-| `account/logout` | Logout and clear auth state |
-| `account/rateLimits/read` | Rate limit snapshot |
-| `skills/list` | Returns empty list |
-| `plugin/list` | Returns empty list |
-| `app/list` | Returns empty list |
-
-### Stubbed (Return Empty/Default)
-
-| Method | Response |
-|--------|----------|
-| `collaborationMode/list` | Empty list |
-| `experimentalFeature/list` | Empty list |
-| `mcpServerStatus/list` | Empty list |
-
-### Not Supported
-
-Any unrecognized method returns JSON-RPC error `-32601 Method not found`. This allows the GUI to gracefully degrade for features that don't have backend equivalents (sub-agents, MCP tools, worktrees, realtime voice, etc.).
-
-## Streaming Events
-
-Notifications emitted to the GUI during turns:
-
-| Notification | When |
-|-------------|------|
-| `thread/started` | New thread created |
-| `thread/status/changed` | Thread state transition |
-| `thread/name/updated` | Thread renamed |
-| `turn/started` | Turn begins |
-| `turn/completed` | Turn ends (completed / interrupted / failed) |
-| `item/started` | New ThreadItem begins (message, command, file change) |
-| `item/completed` | ThreadItem finished |
-| `item/agentMessage/delta` | Streamed text content |
-| `item/reasoning/summaryTextDelta` | Streamed thinking/reasoning content |
-| `item/commandExecution/outputDelta` | Streamed command output |
-| `item/fileChange/outputDelta` | Streamed file change content |
-| `command/exec/outputDelta` | Standalone shell output (not turn-related) |
-| `thread/tokenUsage/updated` | Token usage statistics |
-| `backend/error` | Backend emits an explicit error event for a thread |
-| `backend/disconnect` | Backend disconnects or child process exits |
-
-## Remote Setup
-
-### SSH Tunnel (WebSocket/TCP)
-
-If `codapter.mjs` is on the remote host's `PATH`, you can sanity-check the remote binary directly:
-
-```bash
-ssh user@remote-host 'codapter.mjs app-server'
+```sh
+export CODAPTER_PI_ARGS='["--mode","rpc","--provider","openai-codex","--model","gpt-6-luna","--thinking","low"]'
+./scripts/codapter.sh
 ```
 
-For an actual remote desktop connection, start a listener on the remote host and forward it locally:
+The desktop can still override the model and effort for an individual thread or turn. For a Pi-only picker, also set `CODAPTER_CODEX_DISABLE=1`.
 
-```bash
-# On remote host:
-node /path/to/codapter.mjs app-server --listen ws://127.0.0.1:9234
+Older releases defaulted to downloading `@mariozechner/pi-coding-agent` with `npx`. Install current Pi and configure it before upgrading. Explicit command and argument overrides still work. Both distribution files must stay together when deploying: `dist/codapter.mjs` and `dist/collab-extension.mjs`.
 
-# From local machine:
-ssh -N -L 9234:127.0.0.1:9234 user@remote-host
+## Remote clients
 
-# Codex Desktop connects to ws://127.0.0.1:9234/
+```sh
+node dist/codapter.mjs app-server --listen ws://127.0.0.1:9234
+node dist/codapter.mjs app-server --listen unix:///tmp/codapter.sock
 ```
 
-### SSH Tunnel (Unix Domain Socket)
+Listeners use the root `/` WebSocket endpoint and expose `/healthz` and `/readyz`. Multiple `--listen` flags are supported. Connections with an Origin header are rejected, but there is no authentication layer. Do not bind an unauthenticated listener to a public interface.
 
-For containerized environments where port publishing is impractical:
+See [integration](docs/integration.md) for SSH forwarding, debugging, and supported flags.
 
-```bash
-# In container:
-node /path/to/codapter.mjs app-server --listen unix://$HOME/.codex/adapter.sock
+## Development and verification
 
-# From local machine (streamlocal forward):
-ssh -N -L 127.0.0.1:9234:/home/user/workspace/.codex/adapter.sock user@host
-
-# Codex Desktop connects to ws://127.0.0.1:9234/
+```sh
+npm run check        # Build the distributable, lint, run deterministic tests
+npm run test:smoke   # Local protocol and subprocess integration fixtures
+npm run test:live    # Installed Pi, real Luna 6, low reasoning
 ```
 
-### Persistent Remote Mode
+The ordinary suite makes no inference calls. The opt-in live test uses your installed Pi configuration and authentication. It reads a random token through an extension tool, checks streaming completion, forks a thread, and resumes it after restarting the adapter. It isolates Codapter state without replacing HOME. It fails rather than choosing another model if Luna 6 is unavailable.
 
-Run with `nohup` so the adapter survives SSH disconnects:
+[Architecture](docs/architecture.md) identifies code owners. [API mapping](docs/api-mapping.md) describes the protocol subset. Historical investigation documents under `docs/bootstrap`, `docs/design`, and `docs/implementation` are not current compatibility guarantees.
 
-```bash
-nohup node /path/to/codapter.mjs app-server \
-  --listen ws://127.0.0.1:9234 \
-  > /tmp/codapter.log 2>&1 &
-```
+## Troubleshooting and limits
 
-The adapter stays alive with backend processes managed by idle timeouts. When Codex Desktop reconnects, it sends `thread/resume` and gets full history from the persistent session files.
+- **Desktop does not connect:** quit the existing app, rebuild, then use the launcher. Current Desktop adds Codex config flags before `app-server`; old Codapter binaries reject them.
+- **Pi startup fails:** run your configured `pi --version` and check the launcher's stderr. Keep your normal extensions enabled while diagnosing.
+- **Wrong backend:** select a `pi::` model. Codex models use native unprefixed IDs.
+- **Extension waits for input:** look for a desktop user-input request. Custom TUI screens cannot be forwarded through Pi RPC.
+- **Separate test state:** set `CODAPTER_STATE_DIR` and `CODAPTER_CONFIG_FILE`. Do not delete your real thread registry to troubleshoot a fresh thread.
+- **Debugging:** pass `--remote-debugging-port=9233` to the launcher when needed. Logs contain prompts, file contents, and tool output. Do not publish them unredacted.
 
-## Backend Interface
-
-Codapter is designed to support multiple backends through the `IBackend` interface. Pi and Codex backends are both implemented, with Codex currently on stdio transport.
-
-```mermaid
-classDiagram
-    class IBackend {
-        <<interface>>
-        +backendType string
-        +initialize() Promise~void~
-        +dispose() Promise~void~
-        +isAlive() boolean
-        +listModels() Promise~BackendModelSummary[]~
-        +parseModelSelection(model) ParsedBackendSelection|null
-        +threadStart(input) Promise~BackendThreadStartResult~
-        +threadResume(input) Promise~BackendThreadResumeResult~
-        +threadFork(input) Promise~BackendThreadForkResult~
-        +threadRead(input) Promise~BackendThreadReadResult~
-        +threadArchive(input) Promise~void~
-        +threadSetName(input) Promise~void~
-        +turnStart(input) Promise~BackendTurnStartResult~
-        +turnInterrupt(input) Promise~void~
-        +resolveServerRequest(input) Promise~void~
-        +onEvent(threadHandle, listener) Disposable
-    }
-
-    class BackendRouter {
-        +listModels() Promise~BackendModelSummary[]~
-        +resolveModelSelection(model) BackendModelSelection
-    }
-
-    class PiBackend
-    class CodexBackend
-
-    IBackend <|.. PiBackend
-    IBackend <|.. CodexBackend
-    BackendRouter --> IBackend
-```
-
-To add a new backend, implement `IBackend` and register it in the CLI bootstrap so `BackendRouter` can aggregate models and route thread/turn operations.
-
-## Project Structure
-
-```
-codapter/
-├── packages/
-│   ├── core/                  # Protocol handling, routing, registry, adapter-native command exec
-│   ├── backend-pi/            # Pi backend implementation
-│   ├── backend-codex/         # Codex app-server proxy backend
-│   ├── collab-extension/      # Pi extension for sub-agent collaboration
-│   └── cli/                   # CLI entry point & transports
-├── dist/                      # Single-file ESM bundle (codapter.mjs)
-├── docs/                      # Architecture, API mapping, integration guide
-├── scripts/                   # Build, debug, and launcher scripts
-└── test/                      # Smoke / integration tests
-```
-
-See [docs/architecture.md](docs/architecture.md) for details on how the packages relate.
-
-## Development
-
-```bash
-# Install dependencies
-npm install
-
-# Build all packages (TypeScript outputs only)
-npm run build
-
-# Build the runnable single-file bundle
-npm run build:dist
-
-# Run tests
-npm run test
-
-# Lint
-npm run lint
-
-# Full check (build + lint + test)
-npm run check
-
-# Run smoke tests (requires Pi with API keys)
-PI_SMOKE_TEST=1 CODEX_SMOKE_TEST=1 npm run test:smoke
-```
-
-## Debugging
-
-### Codapter Debug Log
-
-Enable debug logging to see backend events and Pi process I/O:
-
-```bash
-export CODAPTER_DEBUG_LOG_FILE=/tmp/codapter-debug.jsonl
-node dist/codapter.mjs app-server
-```
-
-The debug log captures backend events with timestamps, Pi process stdin/stdout traffic, and token usage parsing traces.
-
-### Stdio Tap
-
-To inspect the raw JSON-RPC traffic between Codex Desktop and the CLI process, use the stdio tap script. It sits between the GUI and the real CLI, logging every line in both directions:
-
-```bash
-# Tap codapter to see what it sends/receives:
-CODEX_CLI_PATH=./scripts/stdio-tap.mjs /Applications/Codex.app/Contents/MacOS/Codex
-
-# Tap the real codex CLI for comparison:
-TAP_TARGET=/Applications/Codex.app/Contents/Resources/codex \
-  CODEX_CLI_PATH=./scripts/stdio-tap.mjs /Applications/Codex.app/Contents/MacOS/Codex
-```
-
-Log output goes to `/tmp/stdio-tap.log` (override with `TAP_LOG`). Each line is prefixed with direction (`GUI→CLI` or `CLI→GUI`) and a timestamp.
-
-| Variable | Description | Default |
-|----------|-------------|---------|
-| `TAP_TARGET` | Path to the real CLI binary to wrap | `/usr/local/bin/codapter.mjs` |
-| `TAP_LOG` | Path to the tap log file | `/tmp/stdio-tap.log` |
-
-### Codex Desktop Debug Flags
-
-The Codex Desktop Electron app supports build flavor overrides that enable DevTools and a debug menu:
-
-```bash
-# DevTools + debug menu, Sparkle updates still enabled (recommended):
-BUILD_FLAVOR=internal-alpha /Applications/Codex.app/Contents/MacOS/Codex
-
-# DevTools + debug menu + inspect element, Sparkle updates disabled:
-BUILD_FLAVOR=dev /Applications/Codex.app/Contents/MacOS/Codex
-```
-
-These flags are pure functions of `buildFlavor` and cannot be toggled individually. Sparkle (auto-update on macOS) has one additional override:
-
-```bash
-# Disable Sparkle regardless of build flavor:
-CODEX_SPARKLE_ENABLED=false /Applications/Codex.app/Contents/MacOS/Codex
-```
-
-## Limitations
-
-- **Collab requires adapter support**: collab/sub-agent workflows require starting codapter with `--collab` or `CODAPTER_COLLAB=1`
-- **No MCP tools**: MCP server integration is not available through Pi
-- **No realtime/voice**: Pi has no voice API
-- **Cross-backend sub-agents are one-way**: Pi-backed threads can spawn Codex sub-agents, but Codex-backed threads cannot spawn Pi sub-agents
-- **Codex websocket transport deferred**: `CODAPTER_CODEX_TRANSPORT=websocket` returns a deterministic deferred error in this topic
-- **No worktree management**: Git worktree RPCs return method-not-found (planned as future adapter-native feature)
-- **No PTY mode**: `command/exec` with `tty: true` is rejected
-- **Single instance per state directory**: Multi-window concurrent writes to the thread registry are not locked in v0.1
-- **Config store class name**: The class is still named `InMemoryConfigStore` but all writes are persisted to `~/.config/codapter/config.toml`; the name is a vestige of the original design
-
-## Roadmap
-
-- Add Codex websocket transport support
-- Support additional backends beyond Pi and Codex
-- Support additional upstream clients and protocols beyond the current Codex Desktop app-server flow
-- Align adapter types with upstream Codex and `pi-mono` definitions instead of maintaining local copies
+Unsupported surfaces return explicit errors or empty capability listings. Native Codex WebSocket proxying, PTY command execution, desktop worktree management, MCP management, and realtime voice are not implemented. This does not prevent Pi extensions from providing their own tools through Pi.
 
 ## License
 
-See [LICENSE](LICENSE) for details.
+See [LICENSE](LICENSE).

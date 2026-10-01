@@ -4,7 +4,6 @@ import { join } from "node:path";
 import { describe, expect, it } from "vitest";
 import { createCodexBackend } from "../../packages/backend-codex/src/index.js";
 import { AppServerConnection } from "../../packages/core/src/app-server.js";
-import { BackendRouter } from "../../packages/core/src/backend-router.js";
 import type {
   BackendAppServerEvent,
   BackendModelSummary,
@@ -12,8 +11,7 @@ import type {
   ParsedBackendSelection,
 } from "../../packages/core/src/backend.js";
 import { BackendThreadEventBuffer, parseBackendModelId } from "../../packages/core/src/backend.js";
-
-const describeIfCodexSmoke = process.env.CODEX_SMOKE_TEST === "1" ? describe : describe.skip;
+import { BackendRouter } from "../../packages/core/src/backend-router.js";
 
 class SmokePiBackend implements IBackend {
   public readonly backendType = "pi";
@@ -222,7 +220,7 @@ async function waitFor(predicate: () => boolean, timeoutMs = 1500): Promise<void
   throw new Error("Timed out waiting for condition");
 }
 
-describeIfCodexSmoke("codex smoke", () => {
+describe("codex subprocess integration", () => {
   it("aggregates pi and codex models in one picker", async () => {
     const directory = await mkdtemp(join(tmpdir(), "codapter-codex-smoke-"));
     const mockScript = await createMockCodexScript(directory);

@@ -1,5 +1,12 @@
 import type { JsonRpcId } from "./jsonrpc.js";
-import type { JsonValue, SandboxMode, Turn, UserInput } from "./protocol.js";
+import type {
+  JsonValue,
+  ModelAccessPrograms,
+  ModelServiceTier,
+  SandboxMode,
+  Turn,
+  UserInput,
+} from "./protocol.js";
 
 export interface Disposable {
   dispose(): void;
@@ -55,6 +62,15 @@ export interface BackendModelSummary {
   readonly supportedReasoningEfforts: readonly BackendReasoningEffortOption[];
   readonly defaultReasoningEffort: string;
   readonly supportsPersonality: boolean;
+  readonly upgrade?: string | null;
+  readonly upgradeInfo?: JsonValue | null;
+  readonly availabilityNux?: JsonValue | null;
+  readonly modelSpecialty?: string | null;
+  readonly multiAgentVersion?: "disabled" | "v1" | "v2" | null;
+  readonly additionalSpeedTiers?: readonly string[];
+  readonly serviceTiers?: readonly ModelServiceTier[];
+  readonly defaultServiceTier?: string | null;
+  readonly availableAccessPrograms?: ModelAccessPrograms | null;
 }
 
 export interface BackendCapabilities {

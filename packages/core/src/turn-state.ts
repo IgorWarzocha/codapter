@@ -180,7 +180,7 @@ export class TurnStateMachine {
   private async handleTextDelta(delta: string): Promise<void> {
     const itemId = this.agentMessageItemId ?? (await this.startAgentMessageItem());
     const item = this.items.get(itemId);
-    if (!item || item.type !== "agentMessage") {
+    if (item?.type !== "agentMessage") {
       throw new Error(`Agent message item missing for ${itemId}`);
     }
     item.text += delta;
@@ -195,7 +195,7 @@ export class TurnStateMachine {
   private async handleThinkingDelta(delta: string): Promise<void> {
     const itemId = this.reasoningItemId ?? (await this.startReasoningItem());
     const item = this.items.get(itemId);
-    if (!item || item.type !== "reasoning") {
+    if (item?.type !== "reasoning") {
       throw new Error(`Reasoning item missing for ${itemId}`);
     }
     if (item.summary.length === 0) {

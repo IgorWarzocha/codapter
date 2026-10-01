@@ -19,6 +19,7 @@ export type InitializeParams = {
 
 export type InitializeResponse = {
   userAgent: string;
+  codexHome: string;
   platformFamily: string;
   platformOs: string;
 };
@@ -55,6 +56,7 @@ export type Config = {
   review_model: string | null;
   model_context_window: number | null;
   model_auto_compact_token_limit: number | null;
+  model_auto_compact_token_limit_scope: string | null;
   model_provider: string | null;
   approval_policy: string | null;
   approvals_reviewer: string | null;
@@ -74,6 +76,9 @@ export type Config = {
   model_verbosity: string | null;
   service_tier: string | null;
   analytics: JsonValue | null;
+  browser_use: JsonValue | null;
+  computer_use: JsonValue | null;
+  desktop: JsonValue | null;
   [key: string]: JsonValue | undefined;
 };
 
@@ -207,10 +212,14 @@ export type RateLimitWindow = {
 export type RateLimitSnapshot = {
   limitId: string | null;
   limitName: string | null;
+  normalModelSlug: string | null;
   primary: RateLimitWindow | null;
   secondary: RateLimitWindow | null;
   credits: CreditsSnapshot | null;
+  individualLimit: JsonValue | null;
+  spendControlReached: boolean | null;
   planType: PlanType | null;
+  rateLimitReachedType: string | null;
 };
 
 export type GetAccountRateLimitsResponse = {
@@ -244,10 +253,14 @@ export type SkillsListResponse = {
 export type PluginListParams = {
   cwds?: string[] | null;
   forceRemoteSync?: boolean;
+  forceRefetch?: boolean;
+  marketplaceKinds?: string[] | null;
 };
 
 export type PluginListResponse = {
   marketplaces: JsonValue[];
+  marketplaceLoadErrors: JsonValue[];
+  featuredPluginIds: string[];
   remoteSyncError: string | null;
 };
 
@@ -312,13 +325,22 @@ export type Model = {
   availabilityNux: JsonValue | null;
   displayName: string;
   description: string;
+  modelSpecialty: string | null;
   hidden: boolean;
   supportedReasoningEfforts: ReasoningEffortOption[];
   defaultReasoningEffort: string;
   inputModalities: string[];
   supportsPersonality: boolean;
+  multiAgentVersion: "disabled" | "v1" | "v2" | null;
+  additionalSpeedTiers: string[];
+  serviceTiers: ModelServiceTier[];
+  defaultServiceTier: string | null;
+  availableAccessPrograms: ModelAccessPrograms | null;
   isDefault: boolean;
 };
+
+export type ModelServiceTier = { id: string; name: string; description: string };
+export type ModelAccessPrograms = { cyber: ("standard" | "daybreakBlue" | "daybreakRed")[] };
 
 export type ReasoningEffortOption = {
   reasoningEffort: string;
@@ -350,8 +372,13 @@ export type ThreadStatus =
 
 export type UserInput =
   | { type: "text"; text: string; text_elements: JsonValue[] }
-  | { type: "image"; url: string }
-  | { type: "localImage"; path: string }
+  | ({ type: "image"; detail?: "auto" | "low" | "high" | "original" } & (
+      | { url: string; fileId?: never }
+      | { fileId: string; url?: never }
+    ))
+  | { type: "localImage"; path: string; detail?: "auto" | "low" | "high" | "original" }
+  | { type: "audio"; url: string }
+  | { type: "localAudio"; path: string }
   | { type: "skill"; name: string; path: string }
   | { type: "mention"; name: string; path: string };
 
@@ -380,11 +407,16 @@ export type TurnError = {
   message: string;
   codexErrorInfo: JsonValue | null;
   additionalDetails: string | null;
+  misalignment?: JsonValue | null;
 };
 
 export type Turn = {
   id: string;
   items: ThreadItem[];
+  itemsView?: "notLoaded" | "summary" | "full";
+  startedAt?: number | null;
+  completedAt?: number | null;
+  durationMs?: number | null;
   status: TurnStatus;
   error: TurnError | null;
 };
@@ -431,16 +463,28 @@ export type SessionSource =
 
 export type Thread = {
   id: string;
+  sessionId: string;
+  forkedFromId: string | null;
+  parentThreadId: string | null;
   preview: string;
   ephemeral: boolean;
+  section: JsonValue | null;
+  sectionEnteredAt: number | null;
+  projectId: string | null;
+  historyMode: "legacy" | "paginated";
   modelProvider: string;
+  model: string | null;
+  reasoningEffort: string | null;
   createdAt: number;
   updatedAt: number;
+  recencyAt: number | null;
   status: ThreadStatus;
   path: string | null;
   cwd: string;
   cliVersion: string;
+  originator: string | null;
   source: SessionSource;
+  threadSource: string | null;
   agentNickname: string | null;
   agentRole: string | null;
   gitInfo: GitInfo | null;
@@ -471,6 +515,8 @@ export type ThreadStartResponse = {
   model: string;
   modelProvider: string;
   serviceTier: string | null;
+  disabledPluginIds: string[];
+  instructionSources: string[];
   cwd: string;
   approvalPolicy: string;
   approvalsReviewer: string;
@@ -496,7 +542,11 @@ export type ThreadResumeParams = {
   persistExtendedHistory: boolean;
 };
 
-export type ThreadResumeResponse = ThreadStartResponse;
+export type ThreadResumeResponse = ThreadStartResponse & {
+  collaborationMode: JsonValue | null;
+  turnsBackwardsCursor: string | null;
+  itemsBackwardsCursor: string | null;
+};
 
 export type ThreadForkParams = {
   threadId: string;
@@ -521,16 +571,18 @@ export type ThreadListParams = {
   cursor?: string | null;
   limit?: number | null;
   sortKey?: "created_at" | "updated_at" | null;
+  sortDirection?: "asc" | "desc" | null;
   modelProviders?: string[] | null;
   sourceKinds?: string[] | null;
   archived?: boolean | null;
-  cwd?: string | null;
+  cwd?: string | string[] | null;
   searchTerm?: string | null;
 };
 
 export type ThreadListResponse = {
   data: Thread[];
   nextCursor: string | null;
+  backwardsCursor: string | null;
 };
 
 export type ThreadLoadedListParams = {

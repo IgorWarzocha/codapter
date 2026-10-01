@@ -1,7 +1,14 @@
 {
-  "$schema": "https://biomejs.dev/schemas/1.9.4/schema.json",
+  "$schema": "https://biomejs.dev/schemas/2.5.15/schema.json",
   "files": {
-    "ignore": ["dist", "coverage", "codex-prod", "codex-prod-extracted", "upstream"]
+    "includes": [
+      "**",
+      "!**/dist",
+      "!**/coverage",
+      "!**/codex-prod",
+      "!**/codex-prod-extracted",
+      "!**/upstream"
+    ]
   },
   "formatter": {
     "enabled": true,
@@ -12,9 +19,15 @@
   "linter": {
     "enabled": true,
     "rules": {
-      "recommended": true
+      "preset": "recommended"
     }
   },
+  "overrides": [
+    {
+      "includes": ["**/package.json"],
+      "json": { "formatter": { "expand": "auto" } }
+    }
+  ],
   "javascript": {
     "formatter": {
       "quoteStyle": "double",

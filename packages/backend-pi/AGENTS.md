@@ -1,0 +1,4 @@
+- Launch the installed `pi` command, including user wrappers. Do not replace native extensions, provider configuration or system prompts with adapter-owned defaults.
+- Inspect installed Pi's RPC docs before changing the bridge. `agent_settled` ends automatic work; assistant `message_end`, `agent_end` and a `handled` prompt acknowledgement do not establish idle state.
+- Keep native extension-dialog translation bidirectional. Codex questions/answers are not Pi UI request/response records.
+- Deterministic subprocess fixtures test adapter behavior, not installed compatibility. All live model-backed tests must select `openai-codex/gpt-6-luna` with `low` reasoning explicitly. Never inherit the user's model default for a test.

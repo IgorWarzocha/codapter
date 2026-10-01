@@ -14,6 +14,8 @@ export interface ThreadRegistryEntry {
   readonly threadId: string;
   readonly backendSessionId: string;
   readonly backendType: string;
+  readonly sessionId?: string;
+  readonly forkedFromId?: string | null;
   readonly ephemeral: boolean;
   readonly hidden: boolean;
   readonly name: string | null;
@@ -36,6 +38,8 @@ export interface CreateThreadRegistryEntry {
   readonly threadId?: string;
   readonly backendSessionId: string;
   readonly backendType: string;
+  readonly sessionId?: string;
+  readonly forkedFromId?: string | null;
   readonly ephemeral?: boolean;
   readonly hidden?: boolean;
   readonly name?: string | null;
@@ -89,7 +93,10 @@ function defaultLogger(): ThreadRegistryLogger {
 }
 
 function defaultStateFilePath(): string {
-  return resolve(homedir(), ".local", "share", "codapter", "threads.json");
+  return resolve(
+    process.env.CODAPTER_STATE_DIR ?? resolve(homedir(), ".local", "share", "codapter"),
+    "threads.json"
+  );
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -123,6 +130,10 @@ function isThreadRegistryEntry(value: unknown): value is ThreadRegistryEntry {
     typeof value.threadId === "string" &&
     typeof value.backendSessionId === "string" &&
     typeof value.backendType === "string" &&
+    (typeof value.sessionId === "string" || value.sessionId === undefined) &&
+    (typeof value.forkedFromId === "string" ||
+      value.forkedFromId === null ||
+      value.forkedFromId === undefined) &&
     (typeof value.ephemeral === "boolean" || value.ephemeral === undefined) &&
     (typeof value.hidden === "boolean" || value.hidden === undefined) &&
     (typeof value.name === "string" || value.name === null) &&
@@ -259,8 +270,11 @@ export class ThreadRegistry {
     await this.load();
 
     const now = new Date().toISOString();
+    const threadId = input.threadId ?? randomUUID();
     const entry: ThreadRegistryEntry = {
-      threadId: input.threadId ?? randomUUID(),
+      threadId,
+      sessionId: input.sessionId ?? threadId,
+      forkedFromId: input.forkedFromId ?? null,
       backendSessionId: input.backendSessionId,
       backendType: input.backendType,
       ephemeral: input.ephemeral ?? false,

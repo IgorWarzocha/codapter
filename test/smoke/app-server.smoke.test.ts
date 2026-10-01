@@ -11,8 +11,6 @@ import {
 } from "../../packages/core/src/backend.js";
 import { ThreadRegistry } from "../../packages/core/src/thread-registry.js";
 
-const describeIfSmoke = process.env.PI_SMOKE_TEST === "1" ? describe : describe.skip;
-
 class SmokeBackend implements IBackend {
   public readonly backendType = "pi";
   private readonly listeners = new Map<string, Set<(event: BackendAppServerEvent) => void>>();
@@ -98,7 +96,7 @@ class SmokeBackend implements IBackend {
     threadId: string;
     threadHandle: string;
     turnId: string;
-    input: readonly Array<{ type: string; text?: string }>;
+    input: ReadonlyArray<{ type: string; text?: string }>;
     model: string | null;
   }) {
     const text = input.input
@@ -345,7 +343,7 @@ async function startTurn(
   });
 }
 
-describeIfSmoke("codapter smoke", () => {
+describe("codapter lifecycle integration", () => {
   // 1. Basic conversation (2+2)
   it("completes a basic conversation turn", async () => {
     const directory = await mkdtemp(join(tmpdir(), "codapter-smoke-"));

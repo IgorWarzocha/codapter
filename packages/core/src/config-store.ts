@@ -21,6 +21,7 @@ function createDefaultConfig(): Config {
     review_model: null,
     model_context_window: null,
     model_auto_compact_token_limit: null,
+    model_auto_compact_token_limit_scope: null,
     model_provider: null,
     approval_policy: null,
     approvals_reviewer: null,
@@ -40,6 +41,9 @@ function createDefaultConfig(): Config {
     model_verbosity: null,
     service_tier: null,
     analytics: null,
+    browser_use: null,
+    computer_use: null,
+    desktop: null,
   };
 }
 
@@ -217,7 +221,10 @@ export class InMemoryConfigStore {
   private versionCounter = 1;
   private readonly config: Config;
 
-  constructor(filePath = resolve(homedir(), ".config", "codapter", "config.toml")) {
+  constructor(
+    filePath = process.env.CODAPTER_CONFIG_FILE ??
+      resolve(homedir(), ".config", "codapter", "config.toml")
+  ) {
     this.filePath = filePath;
     this.config = loadConfigFromDisk(filePath);
   }

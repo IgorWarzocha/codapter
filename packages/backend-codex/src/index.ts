@@ -19,16 +19,11 @@ import type {
   BackendTurnStartResult,
   Disposable,
   IBackend,
+  JsonRpcId,
   ParsedBackendSelection,
 } from "@codapter/core";
 import { BackendThreadEventBuffer, parseBackendModelId } from "@codapter/core";
-import type { JsonRpcId } from "@codapter/core";
-
-interface JsonRpcResponse {
-  readonly id: JsonRpcId | null;
-  readonly result?: unknown;
-  readonly error?: unknown;
-}
+import { parseModelCatalog } from "./model-catalog.js";
 
 interface JsonRpcRequest {
   readonly id: JsonRpcId;
@@ -261,39 +256,21 @@ export class CodexBackend implements IBackend {
 
   async listModels(): Promise<readonly BackendModelSummary[]> {
     this.assertReady();
-    const response = (await this.sendRequest("model/list", {})) as { data?: unknown[] };
-    const models = Array.isArray(response.data) ? response.data : [];
-    return models
-      .filter((value): value is Record<string, unknown> => isRecord(value))
-      .map((model, index) => {
-        const id = typeof model.id === "string" ? rawModelId(model.id) : `model-${index}`;
-        const rawModel = typeof model.model === "string" ? rawModelId(model.model) : id;
-        return {
-          id,
-          model: rawModel,
-          displayName: typeof model.displayName === "string" ? model.displayName : rawModel,
-          description: typeof model.description === "string" ? model.description : rawModel,
-          hidden: Boolean(model.hidden),
-          isDefault: Boolean(model.isDefault),
-          inputModalities: Array.isArray(model.inputModalities)
-            ? model.inputModalities.filter((entry): entry is string => typeof entry === "string")
-            : ["text"],
-          supportedReasoningEfforts: Array.isArray(model.supportedReasoningEfforts)
-            ? model.supportedReasoningEfforts
-                .filter((entry): entry is Record<string, unknown> => isRecord(entry))
-                .map((entry) => ({
-                  reasoningEffort:
-                    typeof entry.reasoningEffort === "string" ? entry.reasoningEffort : "medium",
-                  description: typeof entry.description === "string" ? entry.description : "",
-                }))
-            : [],
-          defaultReasoningEffort:
-            typeof model.defaultReasoningEffort === "string"
-              ? model.defaultReasoningEffort
-              : "medium",
-          supportsPersonality: Boolean(model.supportsPersonality),
-        } satisfies BackendModelSummary;
-      });
+    const models: unknown[] = [];
+    let cursor: string | null = null;
+    const seenCursors = new Set<string>();
+    do {
+      const response = await this.sendRequest("model/list", { cursor, includeHidden: true });
+      if (!isRecord(response) || !Array.isArray(response.data)) {
+        throw new Error("Invalid Codex model/list response");
+      }
+      models.push(...response.data);
+      cursor = typeof response.nextCursor === "string" ? response.nextCursor : null;
+      if (cursor !== null && seenCursors.has(cursor))
+        throw new Error("Codex model/list repeated a cursor");
+      if (cursor !== null) seenCursors.add(cursor);
+    } while (cursor !== null);
+    return parseModelCatalog(models);
   }
 
   async threadStart(input: BackendThreadStartInput): Promise<BackendThreadStartResult> {

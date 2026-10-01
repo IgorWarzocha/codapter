@@ -1,5 +1,4 @@
 import { randomUUID } from "node:crypto";
-import { BackendRouter } from "./backend-router.js";
 import type {
   BackendAppServerEvent,
   BackendSessionLaunchConfig,
@@ -8,6 +7,7 @@ import type {
   Disposable,
   IBackend,
 } from "./backend.js";
+import { BackendRouter } from "./backend-router.js";
 import { AGENT_NICKNAMES } from "./collab-nicknames.js";
 import type {
   CollabAgent,
@@ -48,13 +48,19 @@ function previewFromItems(items: readonly UserInput[] | undefined, fallback: str
         case "text":
           return [item.text];
         case "image":
-          return [`[image] ${item.url}`];
+          return [`[image] ${item.url ?? item.fileId}`];
         case "localImage":
           return [`[local image] ${item.path}`];
+        case "audio":
+          return [`[audio] ${item.url}`];
+        case "localAudio":
+          return [`[local audio] ${item.path}`];
         case "skill":
           return [`[skill:${item.name}] ${item.path}`];
         case "mention":
           return [`[mention:${item.name}] ${item.path}`];
+        default:
+          throw new Error("Unsupported collaboration input type");
       }
     })
     .join("\n")
@@ -732,7 +738,7 @@ export class CollabManager {
   private async startPrompt(agentId: string, input: readonly UserInput[]): Promise<void> {
     const agent = this.agents.get(agentId);
     const runtime = this.agentRuntimes.get(agentId);
-    if (!agent || !runtime || !runtime.activeTurnId) {
+    if (!agent || !runtime?.activeTurnId) {
       return;
     }
 

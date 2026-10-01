@@ -9,11 +9,13 @@
 import { spawn } from "node:child_process";
 import { createWriteStream } from "node:fs";
 import { createInterface } from "node:readline";
+import { fileURLToPath } from "node:url";
 
-const target = process.env.TAP_TARGET || "/usr/local/bin/codapter.mjs";
+const target =
+  process.env.TAP_TARGET || fileURLToPath(new URL("../dist/codapter.mjs", import.meta.url));
 const logPath = process.env.TAP_LOG || "/tmp/stdio-tap.log";
 
-const log = createWriteStream(logPath, { flags: "a" });
+const log = createWriteStream(logPath, { flags: "a", mode: 0o600 });
 
 function ts() {
   return new Date().toISOString();
@@ -23,6 +25,20 @@ function ts() {
 const child = spawn(target, process.argv.slice(2), {
   env: { ...process.env },
   stdio: ["pipe", "pipe", "pipe"],
+});
+
+log.on("error", (error) => {
+  process.stderr.write(`Cannot write traffic log ${logPath}: ${error.message}\n`);
+  child.kill("SIGTERM");
+  process.exitCode = 1;
+});
+child.on("error", (error) => {
+  process.stderr.write(`Cannot launch ${target}: ${error.message}\n`);
+  log.end();
+  process.exitCode = 1;
+});
+child.stdin.on("error", (error) => {
+  if (error.code !== "EPIPE") process.stderr.write(`${error.message}\n`);
 });
 
 // GUI stdin → log + child stdin
@@ -48,7 +64,7 @@ rlErr.on("line", (line) => {
   log.write(`[${ts()}] CLI.err: ${line}\n`);
 });
 
-child.on("exit", (code, signal) => {
+child.on("close", (code, signal) => {
   log.write(`[${ts()}] CLI exited code=${code} signal=${signal}\n`);
   log.end(() => process.exit(code ?? 1));
 });

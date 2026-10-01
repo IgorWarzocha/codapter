@@ -19,11 +19,11 @@ Status:
 
 | Codex concept | Current codapter mapping | Notes |
 | --- | --- | --- |
-| `initialize` request | `AppServerConnection.handleMessage()` in `packages/core/src/app-server.ts` | Accepts `clientInfo` and `capabilities`, validates client identity, and returns `InitializeResponse` with `userAgent`, `platformFamily`, and `platformOs`. |
+| `initialize` request | `AppServerConnection.handleMessage()` in `packages/core/src/app-server.ts` | Accepts `clientInfo` and `capabilities`, validates client identity, and returns `userAgent`, `platformFamily`, `platformOs`, and absolute `codexHome`. |
 | `initialized` notification | `AppServerConnection.handleMessage()` notification path | Marks the connection as initialized. |
 | `optOutNotificationMethods` | `AppServerConnection.emitNotification()` | Exact-match filtering for outgoing notifications. |
-| stdio transport | `packages/cli/src/index.ts` | Default when `app-server` runs without `--listen`. |
-| WebSocket transport | `packages/cli/src/index.ts` | Supports `ws://` and `unix://` listener targets. |
+| stdio transport | `packages/cli/src/stdio.ts` | Default when `app-server` runs without `--listen`. |
+| WebSocket transport | `packages/cli/src/listeners.ts` and `websocket.ts` | Supports `ws://` and `unix://` listener targets. |
 | `/healthz` and `/readyz` | CLI listener HTTP endpoints | Exposed on the WebSocket listener port. |
 
 ## Config And Identity
@@ -34,11 +34,11 @@ Status:
 | `config/value/write` | `InMemoryConfigStore.writeValue()` | Returns typed `ConfigWriteResponse`. |
 | `config/batchWrite` | `InMemoryConfigStore.writeBatch()` | Returns typed `ConfigWriteResponse`. |
 | `configRequirements/read` | `AppServerConnection.handleConfigRequirementsRead()` | Returns `{ requirements: null }`. |
-| `account/read` | `AppServerConnection.handleAccountRead()` | Uses adapter identity and backend auth state. |
-| `getAuthStatus` | `AppServerConnection.handleGetAuthStatus()` | Supported for compatibility. |
-| `skills/list` | `AppServerConnection.handleSkillsList()` | Currently returns an empty payload unless the backend provides data. |
-| `plugin/list` | `AppServerConnection.handlePluginList()` | Currently returns an empty payload unless the backend provides data. |
-| Adapter identity | `packages/core/src/app-server.ts` | Derived from env/TOML override or `codapter/<ADAPTER_VERSION>` (source constant), with platform detection. |
+| `account/read` | `AccountSession.read()` in `packages/core/src/account-session.ts` | Uses adapter identity and backend auth state. |
+| `getAuthStatus` | `AccountSession.authStatus()` | Supported for compatibility. |
+| `skills/list` | `AppServerConnection.handleSkillsList()` | Empty GUI inventory. Native Pi skill loading is unchanged. |
+| `plugin/list` | `AppServerConnection.handlePluginList()` | Empty GUI inventory with current marketplace error and featured-plugin fields. Pi extension loading is unchanged. |
+| Adapter identity | `packages/core/src/app-server-identity.ts` | Derived from env/TOML override or `codapter/<ADAPTER_VERSION>` from `version.ts`, with platform detection. |
 
 ## Threads
 
@@ -74,8 +74,10 @@ Status:
 | `UserInput.type: "text"` | Concatenated into prompt text | Text inputs are joined in order. |
 | `UserInput.type: "image"` | Passed through as backend image input | `url` is mapped to the backend image input contract. |
 | `UserInput.type: "localImage"` | Passed through as backend image input | `path` is mapped to the backend image input contract. |
-| `UserInput.type: "skill"` | Rejected by `turn/start` | Unsupported in the current implementation. |
-| `UserInput.type: "mention"` | Rejected by `turn/start` | Unsupported in the current implementation. |
+| `UserInput.type: "skill"` | Passed to the backend | Pi rejects the desktop attachment variant. Native Pi skills still load normally. |
+| `UserInput.type: "mention"` | Passed to the backend | Pi rejects the desktop attachment variant. Native prompt and extension handling remains unchanged. |
+| `UserInput.type: "audio"` or `"localAudio"` | Backend-owned support | Pi rejects unsupported audio explicitly. |
+| Image containing only a Codex `fileId` | Backend-owned support | Pi requires image data or a local path and rejects file-ID-only input. |
 
 ## Model And Backend
 
@@ -113,6 +115,9 @@ Behavior notes:
 | Thread handle identity | Opaque backend `threadHandle` values | Stored in registry as internal metadata. |
 | `thread/read` | Backend-owned hydration in `PiBackend.threadRead()` | Returns backend-neutral `Turn[]`. |
 | Event stream | Pi notifications mapped to `BackendAppServerEvent` | Routed through `AppServerConnection` publish path. |
+| Turn completion | Pi `agent_settled` | Message and low-level agent endings are not completion. Handled extension commands may start no run. |
+| User input | `packages/backend-pi/src/extension-ui.ts` | Translates native select, confirm, input, and editor requests into Codex questions and decodes the answers map. |
+| Reasoning effort | Pi `set_thinking_level` RPC | Applied after model selection. |
 
 ## Codex Backend
 
@@ -121,7 +126,7 @@ Behavior notes:
 | `CodexBackend` | `packages/backend-codex/src/index.ts` | Proxies upstream `codex app-server` over stdio. |
 | Model id rewrite | Routed `<backend>::<raw>` ids | Rewrites inbound/outbound model ids between adapter and upstream Codex. |
 | Server-request relay | Upstream JSON-RPC request/response mapping | Request ids are tracked and resolved through adapter relay. |
-| Websocket transport | Deterministic defer/reject path | Websocket mode is explicitly deferred in this topic. |
+| WebSocket transport | Explicit unsupported error | Only the native backend proxy lacks WebSocket support, not client listeners. |
 
 ## Unsupported Or Partially Implemented Areas
 

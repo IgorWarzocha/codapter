@@ -1,3 +1,4 @@
+import { randomUUID } from "node:crypto";
 import { mkdir, readFile, rename, writeFile } from "node:fs/promises";
 import { dirname, join } from "node:path";
 
@@ -21,6 +22,8 @@ function createEmptyState(): PiBackendStateFile {
 export class PiBackendStateStore {
   private readonly filePath: string;
   private loaded = false;
+  private loading: Promise<void> | null = null;
+  private writes: Promise<void> = Promise.resolve();
   private state: PiBackendStateFile = createEmptyState();
 
   constructor(sessionDir: string) {
@@ -32,6 +35,15 @@ export class PiBackendStateStore {
       return;
     }
 
+    if (!this.loading) this.loading = this.readState();
+    try {
+      await this.loading;
+    } finally {
+      this.loading = null;
+    }
+  }
+
+  private async readState(): Promise<void> {
     try {
       const raw = await readFile(this.filePath, "utf8");
       const parsed = JSON.parse(raw) as PiBackendStateFile;
@@ -92,13 +104,16 @@ export class PiBackendStateStore {
     return Object.values(this.state.sessions);
   }
 
-  private async persist(): Promise<void> {
-    await mkdir(dirname(this.filePath), { recursive: true, mode: 0o700 });
-    const tempPath = `${this.filePath}.${process.pid}.${Date.now()}.tmp`;
-    await writeFile(tempPath, `${JSON.stringify(this.state, null, 2)}\n`, {
-      encoding: "utf8",
-      mode: 0o600,
+  private persist(): Promise<void> {
+    const snapshot = `${JSON.stringify(this.state, null, 2)}\n`;
+    const write = this.writes.then(async () => {
+      await mkdir(dirname(this.filePath), { recursive: true, mode: 0o700 });
+      const tempPath = `${this.filePath}.${randomUUID()}.tmp`;
+      await writeFile(tempPath, snapshot, { encoding: "utf8", mode: 0o600 });
+      await rename(tempPath, this.filePath);
     });
-    await rename(tempPath, this.filePath);
+    // A failed write remains visible to its caller without poisoning later saves.
+    this.writes = write.catch(() => {});
+    return write;
   }
 }

@@ -5,30 +5,34 @@
   "type": "module",
   "workspaces": ["packages/*"],
   "engines": {
-    "node": ">=22.0.0"
+    "node": "^22.22.1 || ^24.0.0 || >=26.0.0"
   },
   "scripts": {
     "build": "tsc -b",
     "build:dist": "npm run build && node scripts/build-dist.mjs",
-    "check": "npm run build && npm run lint && npm run test",
+    "check": "npm run build:dist && npm run lint && npm run test",
     "gui:audit:collect": "node scripts/gui-audit.mjs collect",
     "gui:audit:compare": "node scripts/gui-audit.mjs compare",
-    "lint": "biome check .",
+    "lint": "biome check --error-on-warnings .",
     "prepare": "husky",
-    "test": "vitest run --passWithNoTests",
-    "test:smoke": "PI_SMOKE_TEST=1 CODEX_SMOKE_TEST=1 vitest run test/smoke/"
+    "test": "vitest run",
+    "test:smoke": "vitest run test/smoke/",
+    "test:live": "npm run build:dist && PI_LIVE_TEST=1 vitest run test/smoke/pi-live.smoke.test.ts"
   },
   "lint-staged": {
-    "*.{js,mjs,cjs,ts,tsx,json,md}": ["biome check --write --no-errors-on-unmatched"]
+    "*.{js,mjs,cjs,ts,tsx,json,md}": [
+      "biome check --write --error-on-warnings --no-errors-on-unmatched"
+    ]
   },
   "devDependencies": {
-    "@biomejs/biome": "^1.9.4",
-    "@types/node": "^22.13.10",
-    "@types/ws": "^8.18.1",
-    "esbuild": "^0.25.0",
-    "husky": "^9.1.7",
-    "lint-staged": "^15.4.3",
-    "typescript": "^5.8.2",
-    "vitest": "^3.0.8"
+    "@biomejs/biome": "2.5.15",
+    "@types/node": "22.20.4",
+    "@types/ws": "8.18.2",
+    "esbuild": "0.28.2",
+    "husky": "9.1.7",
+    "lint-staged": "17.6.0",
+    "typescript": "7.0.2",
+    "vite": "8.3.2",
+    "vitest": "5.0.3"
   }
 }

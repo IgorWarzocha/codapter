@@ -5,7 +5,6 @@ import { join } from "node:path";
 import type {
   BackendAppServerEvent,
   BackendCapabilities,
-  BackendEvent,
   BackendImageInput,
   BackendMessage,
   BackendModelSummary,
@@ -26,20 +25,24 @@ import type {
   BackendTurnStartResult,
   Disposable,
   IBackend,
+  JsonValue,
 } from "@codapter/core";
 import {
   BackendThreadEventBuffer,
-  TurnStateMachine,
   parseBackendModelId,
+  TurnStateMachine,
   toThreadTokenUsage,
 } from "@codapter/core";
+import { mapExtensionDialog, mapExtensionDialogResponse } from "./extension-ui.js";
+import { mapAvailableModelsToSummaries } from "./model-catalog.js";
 import {
+  mapSessionRecordFromSnapshot,
+  type PiProcessEvent,
   type PiProcessLaunchOptions,
   PiProcessSession,
   type PiSessionStateSnapshot,
-  mapAvailableModelsToSummaries,
-  mapSessionRecordFromSnapshot,
 } from "./pi-process.js";
+import { mapHistoryToTurns, mergeHistoryTurnsWithLiveTurn } from "./session-history.js";
 import { type PiBackendSessionRecord, PiBackendStateStore } from "./state-store.js";
 
 export interface PiBackendOptions {
@@ -52,6 +55,7 @@ export interface PiBackendOptions {
   readonly idleTimeoutMs?: number;
   readonly collabExtensionPath?: string | null;
   readonly staticAvailableModelsPath?: string | null;
+  readonly requestTimeoutMs?: number;
 }
 
 interface ManagedSession {
@@ -65,6 +69,7 @@ interface PiThreadRuntime {
   machine: TurnStateMachine | null;
   pendingElicitationPayloads: Map<string, unknown>;
   processSubscription: Disposable | null;
+  eventQueue: Promise<void>;
 }
 
 const DEFAULT_CAPABILITIES: BackendCapabilities = {
@@ -79,8 +84,15 @@ function nowIso(): string {
   return new Date().toISOString();
 }
 
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null;
+}
+
 function defaultSessionDir(): string {
-  return join(homedir(), ".local", "share", "codapter", "backend-pi");
+  return join(
+    process.env.CODAPTER_STATE_DIR ?? join(homedir(), ".local", "share", "codapter"),
+    "backend-pi"
+  );
 }
 
 function cloneMessage(message: BackendMessage): BackendMessage {
@@ -121,340 +133,52 @@ function toRequestedModelCandidates(modelId: string): string[] {
   return [modelId, `openai-codex/${modelId}`];
 }
 
-function toUserMessageContent(input: BackendTurnStartInput["input"]) {
-  return input.map((item) => {
-    switch (item.type) {
-      case "text":
-        return { type: "text", text: item.text };
-      case "image":
-        return { type: "image", url: item.url };
-      case "localImage":
-        return { type: "localImage", path: item.path };
-      case "skill":
-        return { type: "skill", name: item.name, path: item.path };
-      case "mention":
-        return { type: "mention", name: item.name, path: item.path };
-    }
-  });
-}
-
 function normalizeTurnInput(input: BackendTurnStartInput["input"]): {
   text: string;
   images: BackendImageInput[];
+  userContent: JsonValue[];
 } {
   const textParts: string[] = [];
   const images: BackendImageInput[] = [];
+  const userContent: JsonValue[] = [];
   for (const item of input) {
     switch (item.type) {
       case "text":
         textParts.push(item.text);
+        userContent.push({ type: "text", text: item.text });
         break;
       case "image":
+        if (!item.url)
+          throw new Error("Pi image input requires a URL; fileId-only images are unsupported");
         images.push({ type: "image", url: item.url });
+        userContent.push({
+          type: "image",
+          url: item.url,
+          ...(item.detail ? { detail: item.detail } : {}),
+        });
         break;
       case "localImage":
         images.push({ type: "localImage", path: item.path });
+        userContent.push({
+          type: "localImage",
+          path: item.path,
+          ...(item.detail ? { detail: item.detail } : {}),
+        });
         break;
+      case "audio":
+      case "localAudio":
       case "skill":
       case "mention":
         throw new Error(`Unsupported Pi turn input type: ${item.type}`);
+      default:
+        throw new Error("Unsupported Pi turn input");
     }
   }
   return {
     text: textParts.join("\n").trim(),
     images,
+    userContent,
   };
-}
-
-function textFromUnknown(value: unknown): string {
-  if (typeof value === "string") {
-    return value;
-  }
-  if (value === null || value === undefined) {
-    return "";
-  }
-  return JSON.stringify(value);
-}
-
-function isRecord(value: unknown): value is Record<string, unknown> {
-  return typeof value === "object" && value !== null;
-}
-
-function normalizeHistoryContentEntry(entry: unknown): Record<string, unknown> {
-  if (isRecord(entry)) {
-    return structuredClone(entry);
-  }
-  return {
-    type: "text",
-    text: textFromUnknown(entry),
-  };
-}
-
-function userMessageContentFromHistory(value: unknown): Array<Record<string, unknown>> {
-  if (Array.isArray(value)) {
-    return value.map((entry) => normalizeHistoryContentEntry(entry));
-  }
-  if (isRecord(value)) {
-    return [structuredClone(value)];
-  }
-  return [
-    {
-      type: "text",
-      text: textFromUnknown(value),
-    },
-  ];
-}
-
-function textFromHistoryContent(value: unknown): string {
-  if (typeof value === "string") {
-    return value;
-  }
-  if (Array.isArray(value)) {
-    return value.map((entry) => textFromHistoryContent(entry)).join("");
-  }
-  if (!isRecord(value)) {
-    return "";
-  }
-  if (value.type === "text" && typeof value.text === "string") {
-    return value.text;
-  }
-  if (Array.isArray(value.content)) {
-    return textFromHistoryContent(value.content);
-  }
-  return "";
-}
-
-function inferToolCommand(input: unknown): string {
-  if (isRecord(input)) {
-    const command = input.command;
-    if (typeof command === "string") {
-      return command;
-    }
-    if (Array.isArray(command)) {
-      return command.filter((entry): entry is string => typeof entry === "string").join(" ");
-    }
-  }
-  return textFromUnknown(input);
-}
-
-function toolCallCommandFromHistory(block: Record<string, unknown>): string {
-  const fallbackName = typeof block.name === "string" ? block.name : "tool";
-  const command = inferToolCommand(block.arguments);
-  if (command.length === 0) {
-    return fallbackName;
-  }
-  if (isRecord(block.arguments) && "command" in block.arguments) {
-    return command;
-  }
-  return `${fallbackName} ${command}`;
-}
-
-function mapHistoryToTurns(history: readonly BackendMessage[]) {
-  const turns: Array<{
-    id: string;
-    items: Array<Record<string, unknown>>;
-    status: "completed";
-    error: null;
-  }> = [];
-  let current: {
-    id: string;
-    items: Array<Record<string, unknown>>;
-    status: "completed";
-    error: null;
-  } | null = null;
-  const pendingToolItems = new Map<string, Record<string, unknown>>();
-
-  const ensureTurn = (fallbackId: string) => {
-    if (current) {
-      return current;
-    }
-    current = {
-      id: fallbackId,
-      items: [],
-      status: "completed",
-      error: null,
-    };
-    turns.push(current);
-    pendingToolItems.clear();
-    return current;
-  };
-
-  const finalizeTurn = () => {
-    for (const pending of pendingToolItems.values()) {
-      if (pending.type === "commandExecution" && pending.status === "inProgress") {
-        pending.status = "completed";
-        pending.exitCode = pending.exitCode ?? 0;
-        pending.durationMs = pending.durationMs ?? 0;
-      }
-    }
-    pendingToolItems.clear();
-    current = null;
-  };
-
-  for (const message of history) {
-    if (message.role === "user") {
-      finalizeTurn();
-      const turn = ensureTurn(message.id);
-      turn.items.push({
-        type: "userMessage",
-        id: `${message.id}_user`,
-        content: userMessageContentFromHistory(message.content),
-      });
-      continue;
-    }
-
-    const turn = ensureTurn(message.id);
-    if (message.role === "assistant") {
-      const blocks = Array.isArray(message.content) ? message.content : [message.content];
-      for (const [index, block] of blocks.entries()) {
-        if (!isRecord(block)) {
-          const text = textFromHistoryContent(block);
-          if (text.length > 0) {
-            turn.items.push({
-              type: "agentMessage",
-              id: `${message.id}_agent_${index}`,
-              text,
-              phase: null,
-            });
-          }
-          continue;
-        }
-
-        if (block.type === "thinking" && typeof block.thinking === "string") {
-          turn.items.push({
-            type: "reasoning",
-            id: `${message.id}_reasoning_${index}`,
-            summary: [block.thinking],
-            content: [],
-          });
-          continue;
-        }
-
-        if (block.type === "toolCall") {
-          const toolCallId =
-            typeof block.id === "string" && block.id.length > 0
-              ? block.id
-              : `${message.id}_tool_${index}`;
-          const commandItem: Record<string, unknown> = {
-            type: "commandExecution",
-            id: `${message.id}_tool_${index}`,
-            command: toolCallCommandFromHistory(block),
-            cwd: "",
-            processId: null,
-            status: "inProgress",
-            commandActions: [],
-            aggregatedOutput: null,
-            exitCode: null,
-            durationMs: null,
-          };
-          turn.items.push(commandItem);
-          pendingToolItems.set(toolCallId, commandItem);
-          continue;
-        }
-
-        const text = textFromHistoryContent(block);
-        if (text.length > 0) {
-          turn.items.push({
-            type: "agentMessage",
-            id: `${message.id}_agent_${index}`,
-            text,
-            phase: null,
-          });
-        }
-      }
-      continue;
-    }
-
-    if (message.role === "toolResult") {
-      const payload = isRecord(message.content) ? message.content : {};
-      const toolCallId = typeof payload.toolCallId === "string" ? payload.toolCallId : null;
-      const pending = toolCallId ? pendingToolItems.get(toolCallId) : null;
-      const outputText = textFromHistoryContent(payload.content);
-      if (pending) {
-        pending.aggregatedOutput = outputText || null;
-        pending.status = payload.isError ? "failed" : "completed";
-        pending.exitCode = payload.isError ? 1 : 0;
-        pending.durationMs = 0;
-        if (toolCallId) {
-          pendingToolItems.delete(toolCallId);
-        }
-      }
-      continue;
-    }
-
-    const text = textFromHistoryContent(message.content);
-    if (text.length > 0) {
-      turn.items.push({
-        type: "agentMessage",
-        id: `${message.id}_agent`,
-        text,
-        phase: null,
-      });
-    }
-  }
-
-  finalizeTurn();
-  return turns;
-}
-
-function userMessageContentFromTurn(turn: {
-  readonly items?: readonly Record<string, unknown>[];
-}): unknown[] | null {
-  const item = turn.items?.find((entry) => entry.type === "userMessage");
-  if (!item || !Array.isArray(item.content)) {
-    return null;
-  }
-  return item.content;
-}
-
-function historyTailDuplicatesLiveTurn(
-  turns: readonly {
-    readonly items: readonly Record<string, unknown>[];
-    readonly status: string;
-  }[],
-  liveTurn: {
-    readonly items?: readonly Record<string, unknown>[];
-    readonly status?: string;
-  }
-): boolean {
-  if (liveTurn.status !== "inProgress") {
-    return false;
-  }
-
-  const trailingTurn = turns.at(-1);
-  if (!trailingTurn || trailingTurn.status !== "completed") {
-    return false;
-  }
-
-  if (trailingTurn.items.some((item) => item.type !== "userMessage")) {
-    return false;
-  }
-
-  const trailingUserContent = userMessageContentFromTurn(trailingTurn);
-  const liveUserContent = userMessageContentFromTurn(liveTurn);
-  if (!trailingUserContent || !liveUserContent) {
-    return false;
-  }
-
-  return JSON.stringify(trailingUserContent) === JSON.stringify(liveUserContent);
-}
-
-function mergeHistoryTurnsWithLiveTurn(
-  turns: Array<{
-    id: string;
-    items: Array<Record<string, unknown>>;
-    status: "completed";
-    error: null;
-  }>,
-  liveTurn: {
-    readonly items?: readonly Record<string, unknown>[];
-    readonly status?: string;
-  }
-): typeof turns {
-  if (historyTailDuplicatesLiveTurn(turns, liveTurn)) {
-    return turns.slice(0, -1);
-  }
-  return turns;
 }
 
 export class PiBackend implements IBackend {
@@ -466,10 +190,13 @@ export class PiBackend implements IBackend {
     readonly args?: readonly string[];
     readonly env?: NodeJS.ProcessEnv;
     readonly cwd?: string;
+    readonly requestTimeoutMs?: number;
   };
   private readonly idleTimeoutMs: number;
   private readonly stateStore: PiBackendStateStore;
   private readonly sessions = new Map<string, ManagedSession>();
+  private readonly ownedProcesses = new Set<PiProcessSession>();
+  private readonly activating = new Map<string, Promise<ManagedSession>>();
   private readonly idleTimers = new Map<string, ReturnType<typeof setTimeout>>();
   private readonly modelCache = new Map<string, BackendModelSummary>();
   private modelListPromise: Promise<BackendModelSummary[]> | null = null;
@@ -489,6 +216,7 @@ export class PiBackend implements IBackend {
       args?: readonly string[];
       env?: NodeJS.ProcessEnv;
       cwd?: string;
+      requestTimeoutMs?: number;
     } = {};
     if (options.command !== undefined) {
       launchOptions.command = options.command;
@@ -507,6 +235,9 @@ export class PiBackend implements IBackend {
         ...(launchOptions.env ?? {}),
         CODAPTER_DEBUG_LOG_FILE: options.debugLogFilePath ?? "",
       };
+    }
+    if (options.requestTimeoutMs !== undefined) {
+      launchOptions.requestTimeoutMs = options.requestTimeoutMs;
     }
     this.launchOptions = launchOptions;
     this.idleTimeoutMs = options.idleTimeoutMs ?? 300_000;
@@ -529,12 +260,11 @@ export class PiBackend implements IBackend {
     }
     this.idleTimers.clear();
 
-    const disposals = Array.from(this.sessions.values(), async (session) => {
-      await session.process.dispose().catch(() => {});
-    });
+    const disposals = Array.from(this.ownedProcesses, (process) => this.disposeProcess(process));
     await Promise.all(disposals);
 
     this.sessions.clear();
+    this.launchConfigs.clear();
     this.modelCache.clear();
     this.modelListPromise = null;
     for (const runtime of this.threadRuntimes.values()) {
@@ -561,16 +291,24 @@ export class PiBackend implements IBackend {
   async threadStart(input: BackendThreadStartInput): Promise<BackendThreadStartResult> {
     const launchConfig = { ...input.launchConfig, cwd: input.cwd };
     const threadHandle = await this.createSession(launchConfig);
-    if (input.model) {
-      await this.setModel(threadHandle, input.model);
+    try {
+      if (input.model) {
+        await this.setModel(threadHandle, input.model);
+      }
+      if (input.reasoningEffort) {
+        await this.setThinkingLevel(threadHandle, input.reasoningEffort);
+      }
+      this.ensureThreadRuntime(threadHandle, input.threadId);
+      return {
+        threadHandle,
+        path: await this.getSessionPath(threadHandle),
+        model: input.model,
+        reasoningEffort: input.reasoningEffort,
+      };
+    } catch (error) {
+      if (!this.disposed) await this.disposeSession(threadHandle);
+      throw error;
     }
-    this.ensureThreadRuntime(threadHandle, input.threadId);
-    return {
-      threadHandle,
-      path: await this.getSessionPath(threadHandle),
-      model: input.model,
-      reasoningEffort: input.reasoningEffort,
-    };
   }
 
   async threadResume(input: BackendThreadResumeInput): Promise<BackendThreadResumeResult> {
@@ -578,6 +316,9 @@ export class PiBackend implements IBackend {
     const threadHandle = await this.resumeSession(input.threadHandle, launchConfig);
     if (input.model) {
       await this.setModel(threadHandle, input.model);
+    }
+    if (input.reasoningEffort) {
+      await this.setThinkingLevel(threadHandle, input.reasoningEffort);
     }
     this.ensureThreadRuntime(threadHandle, input.threadId);
     return {
@@ -591,16 +332,24 @@ export class PiBackend implements IBackend {
   async threadFork(input: BackendThreadForkInput): Promise<BackendThreadForkResult> {
     const launchConfig = { ...input.launchConfig, cwd: input.cwd };
     const threadHandle = await this.forkSession(input.sourceThreadHandle, launchConfig);
-    if (input.model) {
-      await this.setModel(threadHandle, input.model);
+    try {
+      if (input.model) {
+        await this.setModel(threadHandle, input.model);
+      }
+      if (input.reasoningEffort) {
+        await this.setThinkingLevel(threadHandle, input.reasoningEffort);
+      }
+      this.ensureThreadRuntime(threadHandle, input.threadId);
+      return {
+        threadHandle,
+        path: await this.getSessionPath(threadHandle),
+        model: input.model,
+        reasoningEffort: input.reasoningEffort,
+      };
+    } catch (error) {
+      if (!this.disposed) await this.disposeSession(threadHandle);
+      throw error;
     }
-    this.ensureThreadRuntime(threadHandle, input.threadId);
-    return {
-      threadHandle,
-      path: await this.getSessionPath(threadHandle),
-      model: input.model,
-      reasoningEffort: input.reasoningEffort,
-    };
   }
 
   async threadRead(input: BackendThreadReadInput): Promise<BackendThreadReadResult> {
@@ -639,9 +388,16 @@ export class PiBackend implements IBackend {
   }
 
   async turnStart(input: BackendTurnStartInput): Promise<BackendTurnStartResult> {
+    this.assertReady();
+    const normalized = normalizeTurnInput(input.input);
+    const session = await this.ensureActiveSession(input.threadHandle);
     const runtime = this.ensureThreadRuntime(input.threadHandle, input.threadId);
+    if (runtime.activeTurnId || session.process.isBusy) {
+      throw new Error("Pi thread already has an active turn");
+    }
+    // Reserve ownership before model/thinking RPCs yield to another turn/start.
     runtime.activeTurnId = input.turnId;
-    runtime.machine = new TurnStateMachine(input.threadId, input.turnId, input.cwd, {
+    const machine = new TurnStateMachine(input.threadId, input.turnId, input.cwd, {
       notify: async (method, params) => {
         this.eventBuffer.emit(input.threadHandle, {
           kind: "notification",
@@ -651,61 +407,88 @@ export class PiBackend implements IBackend {
         });
       },
     });
-    await runtime.machine.emitStarted();
-    const userContent = toUserMessageContent(input.input);
-    if (userContent.length > 0) {
-      await runtime.machine.emitUserMessage(userContent as never, {
-        notify: input.emitUserMessage ?? false,
-      });
+    runtime.machine = machine;
+    try {
+      if (input.model) await this.setModel(input.threadHandle, input.model);
+      if (input.reasoningEffort)
+        await this.setThinkingLevel(input.threadHandle, input.reasoningEffort);
+      if (runtime.machine !== machine) throw new Error("Pi turn was interrupted before prompting");
+      await machine.emitStarted();
+      if (normalized.userContent.length > 0) {
+        await machine.emitUserMessage(normalized.userContent, {
+          notify: input.emitUserMessage ?? false,
+        });
+      }
+      if (runtime.machine !== machine) throw new Error("Pi turn was interrupted before prompting");
+      await this.prompt(input.threadHandle, input.turnId, normalized.text, normalized.images);
+      return { accepted: true, turnId: input.turnId };
+    } catch (error) {
+      await runtime.eventQueue;
+      if (runtime.machine === machine) {
+        await machine.handleEvent({
+          sessionId: input.threadHandle,
+          turnId: input.turnId,
+          type: "error",
+          message: error instanceof Error ? error.message : String(error),
+        });
+        runtime.machine = null;
+      }
+      if (runtime.activeTurnId === input.turnId) runtime.activeTurnId = null;
+      throw error;
     }
-
-    if (input.model) {
-      await this.setModel(input.threadHandle, input.model);
-    }
-
-    const normalized = normalizeTurnInput(input.input);
-    await this.prompt(input.threadHandle, input.turnId, normalized.text, normalized.images);
-    return {
-      accepted: true,
-      turnId: input.turnId,
-    };
   }
 
   async turnInterrupt(input: BackendTurnInterruptInput): Promise<void> {
-    await this.abort(input.threadHandle);
     const runtime = this.threadRuntimes.get(input.threadHandle);
-    if (runtime?.machine && runtime.activeTurnId === input.turnId) {
-      await runtime.machine.interrupt();
-      runtime.machine = null;
-      runtime.activeTurnId = null;
+    if (runtime?.activeTurnId !== input.turnId) return;
+    const machine = runtime.machine;
+    runtime.machine = null;
+    // Native abort can emit an aborted assistant and settle before its RPC reply.
+    // Detach the machine while aborting, then publish interruption after the reply.
+    try {
+      await this.abort(input.threadHandle);
+    } catch (error) {
+      await machine?.handleEvent({
+        sessionId: input.threadHandle,
+        turnId: input.turnId,
+        type: "error",
+        message: error instanceof Error ? error.message : String(error),
+      });
+      throw error;
+    } finally {
+      if (runtime.activeTurnId === input.turnId) runtime.activeTurnId = null;
     }
+    await machine?.interrupt();
   }
 
   async resolveServerRequest(input: BackendResolveServerRequestInput): Promise<void> {
     const runtime = this.threadRuntimes.get(input.threadHandle);
     const payload = runtime?.pendingElicitationPayloads.get(String(input.requestId));
-    runtime?.pendingElicitationPayloads.delete(String(input.requestId));
     await this.respondToElicitation(
       input.threadHandle,
       String(input.requestId),
-      (input.response as { result?: unknown })?.result ?? payload ?? { cancelled: true }
+      mapExtensionDialogResponse(String(input.requestId), payload, input.response)
     );
+    runtime?.pendingElicitationPayloads.delete(String(input.requestId));
   }
 
   async createSession(config?: BackendSessionLaunchConfig): Promise<string> {
     this.assertReady();
     const sessionId = opaqueSessionId();
     const process = this.createProcess(sessionId, config);
-    const snapshot = await process.startFresh();
-    const record = await this.persistSnapshot(sessionId, snapshot);
-    const session = { process, record };
-    this.sessions.set(sessionId, session);
-    if (config) {
-      this.launchConfigs.set(sessionId, config);
+    try {
+      const snapshot = await process.startFresh();
+      this.assertReady();
+      const record = await this.persistSnapshot(sessionId, snapshot);
+      this.assertReady();
+      this.sessions.set(sessionId, { process, record });
+      if (config) this.launchConfigs.set(sessionId, config);
+      this.resetIdleTimer(sessionId);
+      return sessionId;
+    } catch (error) {
+      await this.disposeProcess(process);
+      throw error;
     }
-    this.resetIdleTimer(sessionId);
-
-    return sessionId;
   }
 
   async resumeSession(sessionId: string, config?: BackendSessionLaunchConfig): Promise<string> {
@@ -727,28 +510,22 @@ export class PiBackend implements IBackend {
 
     const forkedSessionId = opaqueSessionId();
     const process = this.createProcess(forkedSessionId, config);
-    await process.attachSession(source.record.sessionFile);
-
-    const anchors = await process.getForkMessages();
-    const entryId = anchors.at(-1)?.entryId;
-    if (!entryId) {
-      throw new Error(`Pi session has no fork anchor: ${sessionId}`);
+    try {
+      await process.attachSession(source.record.sessionFile);
+      // clone keeps the whole active branch. fork rewinds to BEFORE a user message.
+      await process.cloneSession();
+      const snapshot = await process.getState();
+      this.assertReady();
+      const record = await this.persistSnapshot(forkedSessionId, snapshot, source.record.createdAt);
+      this.assertReady();
+      this.sessions.set(forkedSessionId, { process, record });
+      if (config) this.launchConfigs.set(forkedSessionId, config);
+      this.resetIdleTimer(forkedSessionId);
+      return forkedSessionId;
+    } catch (error) {
+      await this.disposeProcess(process);
+      throw error;
     }
-
-    const forkResult = await process.forkSession(entryId);
-    if (forkResult.cancelled) {
-      throw new Error(`Pi fork was cancelled for session ${sessionId}`);
-    }
-
-    const snapshot = await process.getState();
-    const record = await this.persistSnapshot(forkedSessionId, snapshot, source.record.createdAt);
-    const session = { process, record };
-    this.sessions.set(forkedSessionId, session);
-    if (config) {
-      this.launchConfigs.set(forkedSessionId, config);
-    }
-    this.resetIdleTimer(forkedSessionId);
-    return forkedSessionId;
   }
 
   async disposeSession(sessionId: string): Promise<void> {
@@ -758,7 +535,7 @@ export class PiBackend implements IBackend {
 
     const session = this.sessions.get(sessionId);
     if (session) {
-      await session.process.dispose().catch(() => {});
+      await this.disposeProcess(session.process);
       this.sessions.delete(sessionId);
     }
     this.launchConfigs.delete(sessionId);
@@ -785,7 +562,7 @@ export class PiBackend implements IBackend {
       await reader.attachSession(record.sessionFile);
       return cloneMessages(await reader.getMessages());
     } finally {
-      await reader.dispose().catch(() => {});
+      await this.disposeProcess(reader);
     }
   }
 
@@ -860,6 +637,15 @@ export class PiBackend implements IBackend {
     const session = await this.ensureActiveSession(sessionId);
     const resolved = await this.resolveModel(modelId);
     await session.process.setModel(resolved.provider, resolved.modelId);
+    session.record = await this.updateRecord(sessionId, {
+      modelId: resolved.id,
+      updatedAt: nowIso(),
+    });
+  }
+
+  async setThinkingLevel(sessionId: string, effort: string): Promise<void> {
+    const session = await this.ensureActiveSession(sessionId);
+    await session.process.setThinkingLevel(effort);
   }
 
   async getCapabilities(): Promise<BackendCapabilities> {
@@ -886,7 +672,10 @@ export class PiBackend implements IBackend {
 
   onEvent(threadHandle: string, listener: (event: BackendAppServerEvent) => void): Disposable {
     this.assertReady();
-    this.ensureThreadRuntime(threadHandle);
+    this.ensureThreadRuntime(
+      threadHandle,
+      this.threadRuntimes.get(threadHandle)?.threadId ?? threadHandle
+    );
     return this.eventBuffer.subscribe(threadHandle, listener);
   }
 
@@ -916,9 +705,16 @@ export class PiBackend implements IBackend {
     if (!session) {
       return;
     }
+    if (session.process.isBusy || this.threadRuntimes.get(sessionId)?.activeTurnId) {
+      this.resetIdleTimer(sessionId);
+      return;
+    }
+    const runtime = this.threadRuntimes.get(sessionId);
+    runtime?.processSubscription?.dispose();
+    if (runtime) runtime.processSubscription = null;
     console.error(`[codapter] Idle timeout: disposing Pi session ${sessionId}`);
-    await session.process.dispose().catch(() => {});
     this.sessions.delete(sessionId);
+    await this.disposeProcess(session.process);
   }
 
   private assertNotDisposed(): void {
@@ -950,33 +746,62 @@ export class PiBackend implements IBackend {
       ...(effectiveLaunchConfig ? { launchConfig: effectiveLaunchConfig } : {}),
     };
 
-    return new PiProcessSession(options);
+    this.assertReady();
+    const process = new PiProcessSession(options);
+    this.ownedProcesses.add(process);
+    return process;
+  }
+
+  private async disposeProcess(process: PiProcessSession): Promise<void> {
+    try {
+      await process.dispose();
+    } finally {
+      this.ownedProcesses.delete(process);
+    }
   }
 
   private async ensureActiveSession(sessionId: string): Promise<ManagedSession> {
+    this.assertReady();
     const existing = this.sessions.get(sessionId);
     if (existing?.process.isRunning()) {
       return existing;
     }
 
+    const pending = this.activating.get(sessionId);
+    if (pending) return await pending;
+    const activation = this.activateSession(sessionId);
+    this.activating.set(sessionId, activation);
+    try {
+      return await activation;
+    } finally {
+      this.activating.delete(sessionId);
+    }
+  }
+
+  private async activateSession(sessionId: string): Promise<ManagedSession> {
+    const existing = this.sessions.get(sessionId);
+    const runtime = this.threadRuntimes.get(sessionId);
+    runtime?.processSubscription?.dispose();
+    if (runtime) runtime.processSubscription = null;
     if (existing) {
-      await existing.process.dispose().catch(() => {});
+      await this.disposeProcess(existing.process);
       this.sessions.delete(sessionId);
     }
-
     const record = await this.requireRecord(sessionId);
-    if (!record.sessionFile) {
-      throw new Error(`Pi session has no session file: ${sessionId}`);
-    }
-
     const process = this.createProcess(sessionId);
-    await process.attachSession(record.sessionFile);
-    const snapshot = await process.getState();
-    const nextRecord = await this.persistSnapshot(sessionId, snapshot, record.createdAt);
-    const session = { process, record: nextRecord };
-    this.sessions.set(sessionId, session);
-
-    return session;
+    try {
+      const snapshot = await process.attachSession(record.sessionFile);
+      this.assertReady();
+      const nextRecord = await this.persistSnapshot(sessionId, snapshot, record.createdAt);
+      this.assertReady();
+      const session = { process, record: nextRecord };
+      this.sessions.set(sessionId, session);
+      if (runtime) runtime.processSubscription = this.subscribeProcessEvents(sessionId);
+      return session;
+    } catch (error) {
+      await this.disposeProcess(process);
+      throw error;
+    }
   }
 
   private ensureThreadRuntime(threadHandle: string, threadId = threadHandle): PiThreadRuntime {
@@ -995,46 +820,57 @@ export class PiBackend implements IBackend {
       machine: null,
       pendingElicitationPayloads: new Map(),
       processSubscription: null,
+      eventQueue: Promise.resolve(),
     };
     this.threadRuntimes.set(threadHandle, runtime);
     runtime.processSubscription = this.subscribeProcessEvents(threadHandle);
     return runtime;
   }
 
-  private subscribeProcessEvents(threadHandle: string): Disposable {
-    const wrappedListener = (event: BackendEvent) => {
-      this.resetIdleTimer(threadHandle);
-      void this.handleProcessEvent(threadHandle, event);
-    };
-
+  private subscribeProcessEvents(threadHandle: string): Disposable | null {
     const session = this.sessions.get(threadHandle);
-    if (session?.process.isRunning()) {
-      return session.process.addListener(wrappedListener);
-    }
-
-    let disposed = false;
-    let listenerDisposable: Disposable | null = null;
-    const disposable: Disposable = {
-      dispose(): void {
-        disposed = true;
-        listenerDisposable?.dispose();
-      },
-    };
-
-    void this.ensureActiveSession(threadHandle).then((active) => {
-      if (!disposed) {
-        listenerDisposable = active.process.addListener(wrappedListener);
-      } else {
-        listenerDisposable?.dispose();
-      }
+    if (!session?.process.isRunning()) return null;
+    return session.process.addListener((event) => {
+      this.resetIdleTimer(threadHandle);
+      const runtime = this.threadRuntimes.get(threadHandle);
+      if (!runtime) return;
+      runtime.eventQueue = runtime.eventQueue
+        .then(() => this.handleProcessEvent(threadHandle, event))
+        .catch((error: unknown) => {
+          this.eventBuffer.emit(threadHandle, {
+            kind: "error",
+            threadHandle,
+            code: "PI_EVENT_FAILED",
+            retryable: false,
+            message: error instanceof Error ? error.message : String(error),
+          });
+        });
     });
-
-    return disposable;
   }
 
-  private async handleProcessEvent(threadHandle: string, event: BackendEvent): Promise<void> {
+  private async handleProcessEvent(threadHandle: string, event: PiProcessEvent): Promise<void> {
     const runtime = this.threadRuntimes.get(threadHandle);
     if (!runtime) {
+      return;
+    }
+
+    if (event.type === "disconnect") {
+      this.eventBuffer.emit(threadHandle, {
+        kind: "disconnect",
+        threadHandle,
+        message: event.message,
+      });
+      return;
+    }
+
+    if (event.type === "extension_error") {
+      this.eventBuffer.emit(threadHandle, {
+        kind: "error",
+        threadHandle,
+        code: "PI_EXTENSION_ERROR",
+        message: event.message,
+        retryable: false,
+      });
       return;
     }
 
@@ -1059,7 +895,7 @@ export class PiBackend implements IBackend {
         threadHandle,
         requestId: event.requestId,
         method: "item/tool/requestUserInput",
-        params: event.payload,
+        params: mapExtensionDialog(event.requestId, event.payload, runtime.threadId, event.turnId),
       });
       return;
     }
@@ -1114,8 +950,9 @@ export class PiBackend implements IBackend {
       throw new Error(`Unknown Pi model: ${modelId}`);
     }
 
-    const provider = model.model.split("/")[0] ?? "";
-    const rawModelId = model.model.split("/")[1] ?? model.model;
+    const separator = model.model.indexOf("/");
+    const provider = model.model.slice(0, separator);
+    const rawModelId = model.model.slice(separator + 1);
     return {
       id: model.id,
       provider,
@@ -1144,11 +981,14 @@ export class PiBackend implements IBackend {
     const probe = this.createProcess(`models:${randomUUID()}`);
     try {
       const models = await probe.getAvailableModels();
-      const summaries = mapAvailableModelsToSummaries(models);
+      const defaults = await probe.getState();
+      const thinkingLevels = await probe.getAvailableThinkingLevels();
+      const summaries = mapAvailableModelsToSummaries(models, { ...defaults, thinkingLevels });
+      this.assertReady();
       this.replaceModelCache(summaries);
       return summaries;
     } finally {
-      await probe.dispose().catch(() => {});
+      await this.disposeProcess(probe);
     }
   }
 

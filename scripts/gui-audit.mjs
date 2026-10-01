@@ -86,9 +86,6 @@ function createNormalizer() {
   const uuidMap = new Map();
   const pathMap = new Map();
   const numberMap = new Map();
-  const uuidCounter = 0;
-  const pathCounter = 0;
-  const numberCounter = 0;
 
   const UUID_RE = /\b[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\b/gi;
   const ISO_RE = /\b\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?Z\b/g;
