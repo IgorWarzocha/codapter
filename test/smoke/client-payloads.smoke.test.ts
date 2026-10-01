@@ -518,7 +518,11 @@ describe("client payload smoke", () => {
           item.type === "userMessage" &&
           JSON.stringify(item.content) ===
             JSON.stringify([
-              { type: "text", text: "Run the `date` command and report the output." },
+              {
+                type: "text",
+                text: "Run the `date` command and report the output.",
+                text_elements: [],
+              },
             ])
       );
       expect(resumedUserMessages).toHaveLength(1);

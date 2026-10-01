@@ -16,16 +16,26 @@ Within those packages, ownership follows the runtime boundary:
 | --- | --- |
 | CLI `config.ts`, `bootstrap.ts` | Arguments, environment validation, backend construction, shutdown |
 | CLI `stdio.ts`, `listeners.ts`, `websocket.ts` | Framing, listener lifetime, connection cleanup |
-| Core `app-server.ts` | Connection dispatch and thread/turn orchestration |
+| Core `app-server.ts` | Connection handshake, dispatch, capability responses, and composition |
+| Core `thread-sessions.ts`, `thread-runtime.ts` | Thread lifecycle, backend subscriptions, readiness, and per-thread event queues |
+| Core `thread-turns.ts`, `thread-execution.ts` | Turn submission and interruption, execution-setting snapshots |
+| Core `thread-history.ts` | Stable turn/item pagination and summary projection over backend-owned history |
+| Core `thread-catalog.ts`, `backend-thread-mirror.ts` | Registry queries and mutations, native child-thread identity translation |
+| Core `backend-server-requests.ts` | Backend request IDs and GUI answer correlation |
+| Core `collab-manager.ts`, `collab-agent-session.ts`, `collab-wait-queue.ts` | Child-agent orchestration, subscribed child lifetime, and pending waits |
 | Core `account-session.ts`, `native-session.ts` | Account state and native Codex transcript parsing |
 | Core `thread-protocol.ts` | Thread serialization and input previews |
 | Core `app-server-identity.ts`, `app-server-log.ts` | Identity and diagnostic effects |
 | Core `version.ts` | Shared CLI and handshake version |
 | Pi `rpc-transport.ts` | Child process, request correlation, failures, orderly EOF shutdown |
-| Pi `pi-process.ts` | Native RPC commands and event translation |
+| Pi `pi-process.ts`, `turn-stream.ts` | Native RPC commands and run association through settlement |
+| Pi `session-runtime.ts`, `model-discovery.ts` | Process activation, probes, idle disposal, persistence, and cached discovery |
+| Pi `thread-controller.ts` | Thread reservations, serialized app-server events, and dialog pairing |
 | Pi `extension-ui.ts` | Pi dialogs and Codex user-input response translation |
 | Pi `session-history.ts` | Pi session history normalization |
-| Pi `index.ts` | Backend thread ownership, model choice, idle process lifecycle |
+| Pi `index.ts` | Public backend composition and thread operations |
+| Codex `rpc-transport.ts`, `index.ts` | Native child and pending RPC lifetime, backend thread routing |
+| Collaboration `collab-client.ts`, `tool-definitions.ts`, `index.ts` | Per-call socket lifetime, native tool schemas, and registration |
 
 ## Request Flow
 
@@ -33,7 +43,7 @@ Within those packages, ownership follows the runtime boundary:
 2. The client sends `initialize`, then `initialized`.
 3. `AppServerConnection` handles config/auth/model/thread/turn RPC methods.
 4. `BackendRouter` aggregates `model/list` and resolves backend-prefixed model ids (`<backendType>::<rawModelId>`).
-5. Thread methods (`thread/start`, `thread/resume`, `thread/fork`, `thread/read`, `thread/archive`, `thread/name/set`) route to the owning backend through `IBackend`.
+5. Thread methods (`thread/start`, `thread/resume`, `thread/fork`, `thread/read`, `thread/archive`, `thread/name/set`) route to the owning backend through `IBackend`. `thread/turns/list` and `thread/items/list` page the same normalized history with stable ID anchors.
 6. Turn methods (`turn/start`, `turn/interrupt`) run on the owning backend thread handle.
 7. Backend-originated notifications/server-requests/errors/disconnects are published as Codex app-server notifications.
 8. `command/exec` remains adapter-native and does not route through backends.
@@ -102,4 +112,5 @@ With collaboration enabled, `CollabManager` routes child-agent operations (`spaw
 - Pi-backed threads can spawn Codex sub-agents, but Codex-backed threads cannot spawn Pi sub-agents.
 - `command/exec` PTY mode is not implemented (`tty: true` rejected).
 - MCP server elicitation remains unsupported.
+- GUI-provided dynamic tool definitions and calls are not bridged into Pi. A desktop plugin's agent-facing tools are not available merely because the GUI has enabled that plugin.
 - Desktop sandbox labels do not sandbox native Pi tools. Pi retains its installed permissions and extension behavior.

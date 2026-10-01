@@ -15,9 +15,11 @@ import {
 import type {
   ModelListResponse,
   ThreadForkResponse,
+  ThreadItemsListResponse,
   ThreadReadResponse,
   ThreadResumeResponse,
   ThreadStartResponse,
+  ThreadTurnsListResponse,
   TurnStartResponse,
 } from "../../packages/core/src/protocol.js";
 
@@ -27,6 +29,10 @@ const BUNDLE = fileURLToPath(new URL("../../dist/codapter.mjs", import.meta.url)
 // Real process boundary, not a provider double. HOME stays intact so Pi loads the
 // installed wrapper, authentication, extensions, and prompts unchanged.
 function startClient(directory: string) {
+  const piArgs: unknown = JSON.parse(process.env.CODAPTER_PI_ARGS ?? '["--mode","rpc"]');
+  if (!Array.isArray(piArgs) || !piArgs.every((arg) => typeof arg === "string")) {
+    throw new Error("CODAPTER_PI_ARGS must be a JSON array of strings");
+  }
   const child = spawn(
     process.execPath,
     [BUNDLE, "-c", "features.code_mode_host=true", "app-server", "--analytics-default-enabled"],
@@ -40,10 +46,9 @@ function startClient(directory: string) {
         CODAPTER_PI_DISABLE: "0",
         CODAPTER_COLLAB: "0",
         CODAPTER_LISTEN: "",
-        CODAPTER_PI_COMMAND: "pi",
+        CODAPTER_PI_COMMAND: process.env.CODAPTER_PI_COMMAND || "pi",
         CODAPTER_PI_ARGS: JSON.stringify([
-          "--mode",
-          "rpc",
+          ...piArgs,
           "--provider",
           "openai-codex",
           "--model",
@@ -209,6 +214,33 @@ describe.skipIf(process.env.PI_LIVE_TEST !== "1")("installed Pi with Luna 6 low"
       expect(resumed.thread.id).toBe(threadId);
       expect(resumed.reasoningEffort).toBe("low");
       expect(JSON.stringify(resumed.thread.turns)).toContain(marker);
+      const turnPage = await client.request<ThreadTurnsListResponse>("thread/turns/list", {
+        threadId,
+        cursor: null,
+        itemsView: "notLoaded",
+        sortDirection: "desc",
+      });
+      expect(turnPage.data.length).toBeGreaterThan(0);
+      expect(turnPage.data[0]).toMatchObject({ items: [], itemsView: "notLoaded" });
+      const itemPage = await client.request<ThreadItemsListResponse>("thread/items/list", {
+        threadId,
+        turnId: turnPage.data[0].id,
+        limit: 100,
+      });
+      expect(itemPage.nextCursor).toBeNull();
+      const user = itemPage.data
+        .map(({ item }) => item)
+        .find((item) => item.type === "userMessage");
+      expect(user).toMatchObject({
+        content: [expect.objectContaining({ type: "text", text_elements: [] })],
+      });
+      expect(
+        itemPage.data
+          .map(({ item }) => item)
+          .filter((item) => item.type === "agentMessage")
+          .map((item) => item.text)
+          .join("\n")
+      ).toContain(marker);
       await client.request("thread/archive", { threadId });
       await client.request("thread/archive", { threadId: forked.thread.id });
     } finally {

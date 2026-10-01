@@ -403,6 +403,8 @@ export type ThreadItem =
 
 export type TurnStatus = "completed" | "interrupted" | "failed" | "inProgress";
 
+export type TurnItemsView = "notLoaded" | "summary" | "full";
+
 export type TurnError = {
   message: string;
   codexErrorInfo: JsonValue | null;
@@ -413,7 +415,7 @@ export type TurnError = {
 export type Turn = {
   id: string;
   items: ThreadItem[];
-  itemsView?: "notLoaded" | "summary" | "full";
+  itemsView?: TurnItemsView;
   startedAt?: number | null;
   completedAt?: number | null;
   durationMs?: number | null;
@@ -602,6 +604,45 @@ export type ThreadReadParams = {
 
 export type ThreadReadResponse = {
   thread: Thread;
+};
+
+export type ThreadTurnsListParams = {
+  threadId: string;
+  cursor?: string | null;
+  limit?: number | null;
+  sortDirection?: "asc" | "desc" | null;
+  itemsView?: TurnItemsView | null;
+};
+
+export type ThreadTurnsListResponse = {
+  data: Turn[];
+  nextCursor: string | null;
+  backwardsCursor: string | null;
+};
+
+export type ThreadItemsListAnchor = { type: "item"; itemId: string };
+
+export type ThreadItemsListCursor = string | ThreadItemsListAnchor;
+
+export type ThreadItemsListParams = {
+  threadId: string;
+  turnId?: string | null;
+  cursor?: ThreadItemsListCursor | null;
+  limit?: number | null;
+  sortDirection?: "asc" | "desc" | null;
+};
+
+export type ThreadItemEntry = {
+  turnId: string;
+  item: ThreadItem;
+  startedAtMs: number | null;
+  completedAtMs: number | null;
+};
+
+export type ThreadItemsListResponse = {
+  data: ThreadItemEntry[];
+  nextCursor: string | null;
+  backwardsCursor: string | null;
 };
 
 export type ThreadSetNameParams = {

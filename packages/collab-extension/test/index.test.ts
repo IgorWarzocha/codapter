@@ -7,9 +7,13 @@ import collabExtension, { CollabClient } from "../src/index.js";
 
 const originalCollabUds = process.env.CODAPTER_COLLAB_UDS;
 const originalParentThread = process.env.CODAPTER_COLLAB_PARENT_THREAD;
+const originalModelsDescription = process.env.CODAPTER_COLLAB_AVAILABLE_MODELS_DESCRIPTION;
 
 function restoreEnv(
-  name: "CODAPTER_COLLAB_UDS" | "CODAPTER_COLLAB_PARENT_THREAD",
+  name:
+    | "CODAPTER_COLLAB_UDS"
+    | "CODAPTER_COLLAB_PARENT_THREAD"
+    | "CODAPTER_COLLAB_AVAILABLE_MODELS_DESCRIPTION",
   value: string | undefined
 ) {
   if (value === undefined) {
@@ -66,6 +70,7 @@ async function createSocketServer(
 afterEach(() => {
   restoreEnv("CODAPTER_COLLAB_UDS", originalCollabUds);
   restoreEnv("CODAPTER_COLLAB_PARENT_THREAD", originalParentThread);
+  restoreEnv("CODAPTER_COLLAB_AVAILABLE_MODELS_DESCRIPTION", originalModelsDescription);
 });
 
 describe("CollabClient", () => {
@@ -115,6 +120,45 @@ describe("CollabClient", () => {
       await server.close();
     }
   });
+
+  it("rejects a pre-aborted native tool call without opening a socket", async () => {
+    const client = new CollabClient("/tmp/does-not-exist-collab.sock");
+    const controller = new AbortController();
+    controller.abort();
+    await expect(
+      client.call("collab/spawn", {}, { signal: controller.signal })
+    ).rejects.toMatchObject({
+      code: "aborted",
+    });
+  });
+
+  it.each(["wrong-id", "missing-result", "both", "invalid-error", "invalid-json"])(
+    "rejects invalid responses and closes the request socket: %s",
+    async (mode) => {
+      let closed: Promise<void> | undefined;
+      const server = await createSocketServer((request, socket) => {
+        closed = new Promise<void>((resolve) => socket.once("close", () => resolve()));
+        const response =
+          mode === "wrong-id"
+            ? { id: "other", result: {} }
+            : mode === "missing-result"
+              ? { id: request.id }
+              : mode === "both"
+                ? { id: request.id, result: {}, error: {} }
+                : { id: request.id, error: "bad" };
+        socket.write(`${mode === "invalid-json" ? "not-json" : JSON.stringify(response)}\n`);
+      });
+      try {
+        const client = new CollabClient(server.socketPath);
+        await expect(client.call("collab/spawn", {}, { timeoutMs: 1000 })).rejects.toMatchObject({
+          code: "invalid_response",
+        });
+        await closed;
+      } finally {
+        await server.close();
+      }
+    }
+  );
 });
 
 describe("collabExtension", () => {
@@ -141,14 +185,6 @@ describe("collabExtension", () => {
       await collabExtension({
         registerTool(tool) {
           tools.push(tool);
-        },
-        async listModels() {
-          return [
-            {
-              model: "gpt-5.4-mini",
-              supportedReasoningEfforts: [{ reasoningEffort: "medium" }],
-            },
-          ];
         },
       });
 
@@ -194,7 +230,6 @@ describe("collabExtension", () => {
       expect(spawnTool?.description).toContain("pi::anthropic/claude-opus-4-6");
       expect(spawnTool?.description).toContain("gpt-5.4");
     } finally {
-      process.env.CODAPTER_COLLAB_AVAILABLE_MODELS_DESCRIPTION = undefined;
       await server.close();
     }
   });

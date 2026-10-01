@@ -3,9 +3,25 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, expect, it } from "vitest";
 import { createPiBackend, PiBackend } from "../src/index.js";
+import { mapHistoryToTurns } from "../src/session-history.js";
 import { createMockPiScript, createModelProbeScript, waitFor } from "./pi-fixture.js";
 
 describe("PiBackend", () => {
+  it.each(["hello", { type: "text", text: "hello" }, [{ type: "text", text: "hello" }]])(
+    "hydrates required desktop text fields from native content %j",
+    (content) => {
+      const original = structuredClone(content);
+      const turns = mapHistoryToTurns([
+        { id: "user", role: "user", content, createdAt: "2026-10-01T00:00:00Z" },
+      ]);
+      expect(turns[0].items[0]).toMatchObject({
+        type: "userMessage",
+        content: [{ type: "text", text: "hello", text_elements: [] }],
+      });
+      expect(content).toEqual(original);
+    }
+  );
+
   it("requires initialize before use", async () => {
     const backend = new PiBackend();
     await expect(backend.createSession()).rejects.toThrow(
@@ -201,7 +217,7 @@ describe("PiBackend", () => {
       expect.arrayContaining([
         expect.objectContaining({
           type: "userMessage",
-          content: [{ type: "text", text: "hello world" }],
+          content: [{ type: "text", text: "hello world", text_elements: [] }],
         }),
         expect.objectContaining({
           type: "commandExecution",
@@ -419,7 +435,11 @@ describe("PiBackend", () => {
             item.type === "userMessage" &&
             JSON.stringify(item.content) ===
               JSON.stringify([
-                { type: "text", text: "Run the `date` command and report the output." },
+                {
+                  type: "text",
+                  text: "Run the `date` command and report the output.",
+                  text_elements: [],
+                },
               ])
         )
       ).toHaveLength(1);

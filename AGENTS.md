@@ -1,14 +1,9 @@
 - Preserve the installed `pi` command and its configuration. Never replace it with an `npx` download or disable user extensions to make an integration pass.
 - Keep the GUI a protocol client. Pi owns its tools, skills, prompts, provider authentication, and extension hooks. Codapter owns translation and process lifecycle, not a parallel Pi configuration.
-- Pi RPC completion is `agent_settled`, not `message_end` or `agent_end`. A handled prompt may start no run. Keep these paths distinct.
 - Ordinary tests use controlled fixtures and no inference. `npm run test:live` uses installed Pi with `openai-codex/gpt-6-luna` and low reasoning. Never silently substitute another model or inherit Pi's default reasoning.
 - Use `CODAPTER_STATE_DIR` and `CODAPTER_CONFIG_FILE` for isolated repros. Do not delete real thread state or replace HOME to hide extension/configuration failures.
-- Keep models backend-owned. Pi IDs are `pi::<provider>/<model>`, native Codex IDs remain unprefixed. Persist both backend type and opaque session handle.
-- `packages/core/src/protocol.ts` is a maintained protocol subset, not generated truth. Verify wire changes against `codex app-server generate-ts` or `generate-json-schema` from the installed CLI. Never patch installed Codex or Pi artifacts.
-- Current ChatGPT Desktop passes `-c features.code_mode_host=true` before `app-server`. Preserve this launch path and test the built bundle, not only workspace imports.
 - Run focused checks during changes, then `npm run check` once after review converges. This gate builds distribution artifacts, lints, and runs deterministic tests. Live tests are separate and must be reported explicitly.
-- `scripts/codapter.sh` and `scripts/codex.sh` launch the adapter and native comparison. Quit one before switching. Logs contain prompts and tool output. Never commit them.
+- Split by responsibility and move its state, failure handling, and cleanup together. Do not route feature work through a catch-all connection context or split a coherent state machine merely to shorten a file.
 - `docs/architecture.md` names current owners. Documents under `docs/bootstrap`, `docs/design`, and `docs/implementation` are historical investigation notes, not current contracts.
 - Keep edits ASCII-only unless the file already uses Unicode.
 - Add changelog entries only under `[Unreleased]`, retaining existing subsections and external attribution. For a PR, open it first, then add its real inline link in a follow-up commit. Never rewrite released sections.
-- Release versions have one code owner, `packages/core/src/version.ts`, updated by `scripts/release.mjs` with the root manifests. Do not add independent CLI or handshake version constants.

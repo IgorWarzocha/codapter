@@ -278,6 +278,31 @@ async function spawnAgent(manager: CollabManager, parentThreadId: string, messag
 }
 
 describe("CollabManager", () => {
+  it("releases an attached child subscription when spawn publication fails", async () => {
+    const { manager, backend, parentThreadId } = createManager({
+      notifySink: {
+        async notify() {
+          throw new Error("client disconnected");
+        },
+      },
+    });
+    const subscribe = backend.onEvent.bind(backend);
+    const dispose = vi.fn();
+    vi.spyOn(backend, "onEvent").mockImplementation((handle, callback) => {
+      const subscription = subscribe(handle, callback);
+      return {
+        dispose() {
+          dispose();
+          subscription.dispose();
+        },
+      };
+    });
+    await expect(spawnAgent(manager, parentThreadId)).rejects.toThrow("client disconnected");
+    expect(dispose).toHaveBeenCalledOnce();
+    expect(backend.disposedSessionIds).toHaveLength(1);
+    await manager.dispose();
+  });
+
   it("transitions pendingInit to running to completed", async () => {
     const { backend, manager, parentThreadId, statusChanges } = createManager({
       config: { minTimeoutMs: 1, defaultTimeoutMs: 5, maxTimeoutMs: 10 },

@@ -19,6 +19,32 @@ async function createRegistry() {
 }
 
 describe("ThreadRegistry", () => {
+  it("persists concurrent mutations in order even within the same millisecond", async () => {
+    const registry = await createRegistry();
+    const now = vi.spyOn(Date, "now").mockReturnValue(1);
+    try {
+      const entries = await Promise.all(
+        Array.from({ length: 12 }, (_, index) =>
+          registry.create({
+            threadId: `thread_${index}`,
+            backendSessionId: `session_${index}`,
+            backendType: "pi",
+          })
+        )
+      );
+      await Promise.all(
+        entries.map((entry, index) => registry.update(entry.threadId, { name: `name_${index}` }))
+      );
+      const disk = await new ThreadRegistry(registry.path).list();
+      expect(disk).toHaveLength(12);
+      expect(disk.map((entry) => entry.name).sort()).toEqual(
+        entries.map((_, index) => `name_${index}`).sort()
+      );
+    } finally {
+      now.mockRestore();
+    }
+  });
+
   it("creates, reads, updates, lists, and deletes entries", async () => {
     const registry = await createRegistry();
     const created = await registry.create({

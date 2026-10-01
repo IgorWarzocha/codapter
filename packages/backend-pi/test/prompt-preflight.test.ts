@@ -27,6 +27,10 @@ function createPreflightSession(mode: string) {
     require('node:readline').createInterface({ input: process.stdin }).on('line', line => {
       const command = JSON.parse(line);
       if (command.type === 'get_state') {
+        if (prompt && mode === 'settled-before-ack') {
+          out({ id: command.id, type: 'response', command: command.type, success: false, error: 'Unexpected idle query after settlement' });
+          return;
+        }
         if (prompt && mode === 'start-during-state' && !started) {
           start();
           // An activity event wins even if this reply carries an idle snapshot.
@@ -43,6 +47,8 @@ function createPreflightSession(mode: string) {
           setTimeout(() => ok(command, { disposition: 'handled' }), 450);
         } else if (mode === 'start-before-ack') {
           start(); ok(command, { disposition: 'handled' }); setTimeout(answer, 80);
+        } else if (mode === 'settled-before-ack') {
+          start(); answer(); ok(command, { disposition: 'handled' });
         } else if (mode === 'active-before-event') {
           active = true; ok(command, { disposition: 'handled' });
           setTimeout(start, 40); setTimeout(answer, 80);
@@ -69,6 +75,15 @@ function createPreflightSession(mode: string) {
 }
 
 describe("native extension prompt preflight", () => {
+  it("does not query idle when native work settles before a handled acknowledgement", async () => {
+    const { session, events } = createPreflightSession("settled-before-ack");
+    await session.prompt("already-settled", "/review");
+    expect(events.filter((event) => event.type === "message_end")).toEqual([
+      expect.objectContaining({ turnId: "already-settled", text: "extension answer" }),
+    ]);
+    expect(session.isBusy).toBe(false);
+  });
+
   it.each(["start-before-ack", "start-during-state", "active-before-event"])(
     "keeps a handled prompt associated with extension work: %s",
     async (mode) => {

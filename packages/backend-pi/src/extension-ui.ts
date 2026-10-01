@@ -78,3 +78,32 @@ export function mapExtensionDialogResponse(
   }
   return { value };
 }
+
+export function normalizeElicitationResponse(
+  requestId: string,
+  responseValue: unknown
+): Record<string, unknown> {
+  if (typeof responseValue === "string") {
+    return { type: "extension_ui_response", id: requestId, value: responseValue };
+  }
+
+  if (typeof responseValue === "boolean") {
+    return { type: "extension_ui_response", id: requestId, confirmed: responseValue };
+  }
+
+  if (isRecord(responseValue)) {
+    if (responseValue.cancelled === true) {
+      return { type: "extension_ui_response", id: requestId, cancelled: true as const };
+    }
+
+    if (typeof responseValue.value === "string") {
+      return { type: "extension_ui_response", id: requestId, value: responseValue.value };
+    }
+
+    if (typeof responseValue.confirmed === "boolean") {
+      return { type: "extension_ui_response", id: requestId, confirmed: responseValue.confirmed };
+    }
+  }
+
+  throw new Error("Unsupported Pi elicitation response shape");
+}

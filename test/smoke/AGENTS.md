@@ -1,0 +1,3 @@
+- Fixture subprocess tests prove adapter behavior, not Pi or Codex compatibility. Keep them inference-free and in the ordinary suite.
+- `pi-live.smoke.test.ts` must launch the distribution bundle with Desktop's real argument order. Keep native HOME and extension loading intact while isolating adapter state, and assert the model and effort recorded in the native session.
+- For desktop checks, inspect `app://-/index.html`, not the hidden avatar overlay or a sandbox webview. Follow `docs/testing/gui-audit.md`, close only your own instance, and delete temporary evidence after checking it.

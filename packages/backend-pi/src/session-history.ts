@@ -16,27 +16,22 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 
 function normalizeHistoryContentEntry(entry: unknown): Record<string, unknown> {
   if (isRecord(entry)) {
-    return structuredClone(entry);
+    const content = structuredClone(entry);
+    // Pi text blocks omit Codex's required UI-span array.
+    if (content.type === "text" && !Array.isArray(content.text_elements)) {
+      content.text_elements = [];
+    }
+    return content;
   }
   return {
     type: "text",
     text: textFromUnknown(entry),
+    text_elements: [],
   };
 }
 
 function userMessageContentFromHistory(value: unknown): Array<Record<string, unknown>> {
-  if (Array.isArray(value)) {
-    return value.map((entry) => normalizeHistoryContentEntry(entry));
-  }
-  if (isRecord(value)) {
-    return [structuredClone(value)];
-  }
-  return [
-    {
-      type: "text",
-      text: textFromUnknown(value),
-    },
-  ];
+  return (Array.isArray(value) ? value : [value]).map(normalizeHistoryContentEntry);
 }
 
 function textFromHistoryContent(value: unknown): string {

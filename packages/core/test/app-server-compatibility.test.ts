@@ -128,10 +128,198 @@ describe("current desktop protocol boundary", () => {
     });
   }
 
+  it.each([
+    ["thread/archive", "fixture/block"],
+    ["thread/archive", "turn/started"],
+    ["thread/resume", "fixture/block"],
+    ["thread/resume", "turn/started"],
+  ])("%s invalidates event continuations blocked at %s", async (method, blockedMethod) => {
+    let release = () => {};
+    let entered = () => {};
+    const barrier = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    const waiting = new Promise<void>((resolve) => {
+      entered = resolve;
+    });
+    await connection.dispose();
+    connection = new AppServerConnection({
+      backend,
+      threadRegistry: registry,
+      logger: { warn },
+      onMessage: async (message) => {
+        messages.push(message);
+        if ("method" in message && message.method === blockedMethod) {
+          entered();
+          await barrier;
+        }
+      },
+    });
+    await initialize();
+    const started = await connection.handleMessage({
+      id: 2,
+      method: "thread/start",
+      params: { model: model.model },
+    });
+    if (!started || !("result" in started)) throw new Error("thread/start failed");
+    const { thread } = started.result as { thread: { id: string } };
+    if (blockedMethod === "fixture/block") {
+      listener?.({
+        kind: "notification",
+        threadHandle: "native",
+        method: blockedMethod,
+        params: { threadId: "native" },
+      });
+    }
+    listener?.({
+      kind: "notification",
+      threadHandle: "native",
+      method: "turn/started",
+      params: {
+        threadId: "native",
+        turn: { id: "stale-turn", status: "inProgress", items: [], error: null },
+      },
+    });
+    try {
+      await waiting;
+      expect(
+        await connection.handleMessage({ id: 3, method, params: { threadId: thread.id } })
+      ).toHaveProperty("result");
+      const countAfterTransition = messages.length;
+      release();
+      // These event translations only await promises, so one event-loop turn
+      // lets both queued work and the blocked publication continuation finish.
+      await new Promise<void>((resolve) => setImmediate(resolve));
+      expect(messages.slice(countAfterTransition)).toEqual([]);
+      expect(await connection.handleMessage({ id: 4, method: "thread/loaded/list" })).toMatchObject(
+        { result: { data: method === "thread/archive" ? [] : [thread.id] } }
+      );
+      if (method === "thread/resume") {
+        expect(
+          await connection.handleMessage({
+            id: 5,
+            method: "thread/read",
+            params: { threadId: thread.id, includeTurns: false },
+          })
+        ).toHaveProperty("result.thread.status.type", "idle");
+      }
+    } finally {
+      release();
+    }
+  });
+
+  it.each(["thread/resume", "thread/fork"])(
+    "releases subscriptions when %s fails after backend attachment",
+    async (method) => {
+      const attached = new Set<string>();
+      backend.onEvent = (handle) => {
+        attached.add(handle);
+        return {
+          dispose() {
+            attached.delete(handle);
+          },
+        };
+      };
+      await initialize();
+      const started = await connection.handleMessage({
+        id: 2,
+        method: "thread/start",
+        params: { model: model.model },
+      });
+      if (!started || !("result" in started)) throw new Error("thread/start failed");
+      const { thread } = started.result as { thread: { id: string } };
+      vi.spyOn(backend, "threadRead").mockRejectedValueOnce(new Error("history unavailable"));
+      expect(
+        await connection.handleMessage({ id: 3, method, params: { threadId: thread.id } })
+      ).toMatchObject({
+        error: { message: "history unavailable" },
+      });
+      expect([...attached]).toEqual(method === "thread/fork" ? ["native"] : []);
+      expect(await connection.handleMessage({ id: 4, method: "thread/loaded/list" })).toMatchObject(
+        {
+          result: { data: method === "thread/fork" ? [thread.id] : [] },
+        }
+      );
+      if (method === "thread/fork") {
+        expect(
+          await connection.handleMessage({
+            id: 5,
+            method: "turn/start",
+            params: {
+              threadId: thread.id,
+              input: [{ type: "text", text: "still ready", text_elements: [] }],
+            },
+          })
+        ).toHaveProperty("result.turn.status", "inProgress");
+      }
+    }
+  );
+
   it("does not compare the independent client product version with the adapter version", async () => {
     expect(await initialize("26.928.31416")).toHaveProperty("result.codexHome", directory);
     expect(connection.clientInfo?.version).toBe("26.928.31416");
     expect(warn).not.toHaveBeenCalled();
+  });
+
+  it("routes arbitrary server requests and both response forms after thread unsubscribe", async () => {
+    const resolveRequest = vi.spyOn(backend, "resolveServerRequest");
+    await initialize();
+    const started = await connection.handleMessage({
+      id: 2,
+      method: "thread/start",
+      params: { model: model.model },
+    });
+    if (!started || !("result" in started)) throw new Error("thread/start failed");
+    const { thread } = started.result as { thread: { id: string } };
+    for (const method of ["fixture/extensionCall", "fixture/otherCall"]) {
+      listener?.({
+        kind: "serverRequest",
+        threadHandle: "native",
+        requestId: 77,
+        method,
+        params: { nested: [{ threadId: "native", thread: { id: "native" } }] },
+      });
+    }
+    await vi.waitFor(() => expect(messages.filter((message) => "id" in message)).toHaveLength(2));
+    const requests = messages.filter((message) => "id" in message);
+    const ids = requests.map((message) => ("id" in message ? message.id : null));
+    expect(new Set(ids).size).toBe(2);
+    expect(requests).toEqual(
+      ["fixture/extensionCall", "fixture/otherCall"].map((method) => ({
+        id: expect.any(String),
+        method,
+        params: { nested: [{ threadId: thread.id, thread: { id: thread.id } }] },
+      }))
+    );
+    await connection.handleMessage({
+      id: 3,
+      method: "thread/unsubscribe",
+      params: { threadId: thread.id },
+    });
+    await connection.handleMessage({ id: ids[0], result: { opaque: "result" } });
+    await connection.handleMessage({
+      id: ids[1],
+      error: { code: -1, message: "extension failure" },
+    });
+    expect(resolveRequest.mock.calls.map(([input]) => input)).toEqual([
+      {
+        threadId: thread.id,
+        threadHandle: "native",
+        requestId: 77,
+        response: { result: { opaque: "result" } },
+      },
+      {
+        threadId: thread.id,
+        threadHandle: "native",
+        requestId: 77,
+        response: { error: { code: -1, message: "extension failure" } },
+      },
+    ]);
+    expect(
+      messages.some((message) => "method" in message && message.method === "serverRequest/resolved")
+    ).toBe(false);
+    await connection.handleMessage({ id: ids[0], result: "duplicate" });
+    expect(resolveRequest).toHaveBeenCalledTimes(2);
   });
 
   it("supplies the required bootstrap fields and uses isolated state paths", async () => {

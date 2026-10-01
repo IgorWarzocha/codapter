@@ -1,0 +1,3 @@
+- Keep `runCli` as the composition root. Validate all enabled backends before starting resources, and unwind partial startup through the same listener/backend shutdown path.
+- Dispatch incoming envelopes independently on every transport. A pending `turn/start` can wait for a question answer or interrupt from that same connection; serializing envelopes deadlocks it.
+- Desktop passes `-c key=value` before `app-server`. Preserve the built-bundle launch path, forward native overrides intact to Codex, and log only ignored keys for Pi, never their values.

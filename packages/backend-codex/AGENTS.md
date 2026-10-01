@@ -1,0 +1,2 @@
+- Keep subprocess, JSON-line framing, RPC correlation, stderr diagnostics, and shutdown in `src/rpc-transport.ts`. Pending RPCs belong to the child lifetime and must reject before waiting for child exit.
+- Keep native thread handles, buffered thread events, and backend model-field rewriting in `src/index.ts`. Transport events are not yet thread-routed. Do not drop the event buffer: native events can arrive before the adapter subscribes.

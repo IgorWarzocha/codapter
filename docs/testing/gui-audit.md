@@ -8,6 +8,8 @@ Use these checks to distinguish adapter failures from model choices and desktop-
 
 `npm run test:live` runs the built CLI against installed Pi, using **Luna 6 with low reasoning**. It reads a fresh token through a native execution tool, checks turn completion, forks, and resumes after a process restart. The test isolates adapter storage while preserving HOME, Pi authentication, wrappers, extensions, and prompts.
 
+For an explicit release check, the live test honors `CODAPTER_PI_COMMAND` and `CODAPTER_PI_ARGS`, then pins Luna 6 and low reasoning. Preserve any wrapper-specific loading flags when selecting another installed release. Do not disable extensions to make it pass.
+
 Do not use Pi's default model or reasoning level for model-backed tests. For native Codex comparison tests, also select `gpt-6-luna` and low reasoning explicitly. If that model is unavailable, stop rather than substitute another.
 
 ## Isolated desktop run
@@ -45,7 +47,7 @@ DevTools lists targets at `http://127.0.0.1:9233/json/list`. Inspect the main `a
 | Interrupt | Interrupt a running tool turn. Pi stops and the thread accepts a subsequent turn |
 | File changes | In a disposable workspace, change one line and compare the real file with the rendered change item. Code-mode tools may report nested effects differently from direct Pi edit tools |
 
-The 2026-10-01 compatibility check used Pi 0.99.2, native Codex CLI 0.159.3, and ChatGPT Desktop 26.928.31416 on Linux. The built-CLI live test passed. The desktop test completed native execution, both `pi-ask` dialogs, and a final Luna 6 response at low reasoning. Native Codex inference was not part of that check.
+The 2026-10-01 compatibility checks used Pi 0.99.2 and the published Pi 1.0.0 package, native Codex CLI 0.159.3, and ChatGPT Desktop 26.928.31416 on Linux. Pi 1.0.0 ran from an isolated installation with the normal HOME and native extensions; the global Pi installation and model defaults were unchanged. Both built-CLI live runs passed on Luna 6 low, including execution, fork, and process restart. The Pi 1.0 desktop check verified native execution, both `pi-ask` dialogs and their returned values, the installed `/marker` command, and cold conversation reopening with paginated history. Native Codex model discovery passed without inference.
 
 Custom terminal UI, themes, widgets, and keybindings are not representable in Pi RPC. Do not treat their absence as an adapter regression or claim that GUI skills/plugin inventories manage Pi extensions.
 

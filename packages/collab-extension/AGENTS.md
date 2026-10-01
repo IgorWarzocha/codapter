@@ -1,0 +1,3 @@
+- Keep native tool schemas and descriptions in `src/tool-definitions.ts`, registration and result envelopes in `src/index.ts`, and socket cancellation, framing and reply validation in `src/collab-client.ts`.
+- The backend injects `CODAPTER_COLLAB_AVAILABLE_MODELS_DESCRIPTION` with cross-backend IDs. Pi's extension API has no `listModels`, `backend.listModels` or `models.list`; do not invent alternate model discovery or strip `pi::` prefixes here.
+- Each call owns one socket and one JSON-RPC ID. Already-aborted calls must not connect; every terminal outcome must close the socket and remove the abort listener and timer.

@@ -4,10 +4,10 @@ import type {
   BackendSessionLaunchConfig,
   BackendThreadForkResult,
   BackendThreadStartResult,
-  Disposable,
   IBackend,
 } from "./backend.js";
 import { BackendRouter } from "./backend-router.js";
+import { CollabAgentSession } from "./collab-agent-session.js";
 import { AGENT_NICKNAMES } from "./collab-nicknames.js";
 import type {
   CollabAgent,
@@ -27,7 +27,9 @@ import type {
   CollabWaitRequest,
   CollabWaitResponse,
 } from "./collab-types.js";
-import type { JsonValue, SandboxMode, UserInput } from "./protocol.js";
+import { CollabWaitQueue } from "./collab-wait-queue.js";
+import type { UserInput } from "./protocol.js";
+import type { ThreadExecutionContext } from "./thread-execution.js";
 
 const DEFAULT_CONFIG: CollabConfig = {
   maxAgents: 10,
@@ -78,19 +80,6 @@ function hasCombinedMessageAndItems(
   );
 }
 
-interface CollabAgentRuntime {
-  backendType: string;
-  subscription: Disposable | null;
-  activeTurnId: string | null;
-  lastAssistantText: string;
-}
-
-interface CollabWaiter {
-  ids: readonly string[];
-  resolve: (response: CollabWaitResponse) => void;
-  timer: ReturnType<typeof setTimeout> | null;
-}
-
 export interface CollabManagerNotificationSink {
   notify(method: string, params: unknown, threadId?: string): Promise<void>;
 }
@@ -110,23 +99,7 @@ export interface CollabManagerCreateChildThreadInput {
   reasoningEffort: string | null;
 }
 
-export interface CollabThreadExecutionContext {
-  readonly cwd: string;
-  readonly model: string | null;
-  readonly approvalPolicy: string | null;
-  readonly approvalsReviewer: string | null;
-  readonly sandbox: SandboxMode | null;
-  readonly sandboxPolicy: JsonValue | null;
-  readonly config: { [key: string]: JsonValue | undefined } | null;
-  readonly reasoningEffort: string | null;
-  readonly serviceTier: string | null;
-  readonly serviceName: string | null;
-  readonly baseInstructions: string | null;
-  readonly developerInstructions: string | null;
-  readonly personality: string | null;
-  readonly summary: string | null;
-  readonly collaborationMode: JsonValue | null;
-}
+export interface CollabThreadExecutionContext extends ThreadExecutionContext {}
 
 export interface CollabManagerOptions {
   backend?: IBackend;
@@ -163,9 +136,9 @@ function collabStateFromAgent(
 
 export class CollabManager {
   private readonly agents = new Map<string, CollabAgent>();
-  private readonly agentRuntimes = new Map<string, CollabAgentRuntime>();
+  private readonly agentRuntimes = new Map<string, CollabAgentSession>();
   private readonly nicknames = new Set<string>();
-  private readonly waiters = new Map<string, CollabWaiter>();
+  private readonly waits: CollabWaitQueue;
   private readonly shuttingDownAgentIds = new Set<string>();
   private readonly config: CollabConfig;
   private readonly backendRouter: BackendRouter;
@@ -204,6 +177,7 @@ export class CollabManager {
       ...DEFAULT_CONFIG,
       ...options.config,
     };
+    this.waits = new CollabWaitQueue((agentId) => this.agents.get(agentId), this.config);
   }
 
   async spawn(req: CollabSpawnRequest): Promise<CollabSpawnResponse> {
@@ -303,7 +277,16 @@ export class CollabManager {
         completionMessage: null,
       };
       this.agents.set(agentId, agent);
-      this.subscribeToAgent(agent, backendType);
+      const runtime = new CollabAgentSession(agent, backendType, {
+        backendRouter: this.backendRouter,
+        resolveThreadExecutionContext: this.resolveThreadExecutionContext,
+        startChildTurn: this.startChildTurn,
+        onChildAgentEvent: this.onChildAgentEvent,
+        onChildAgentStatusChanged: this.onChildAgentStatusChanged,
+        onSettled: (agentId) => this.waits.settled(agentId),
+      });
+      this.agentRuntimes.set(agentId, runtime);
+      runtime.bind(backendType);
 
       const startedItem = this.createToolItem(req.parentThreadId, "spawnAgent", {
         receiverThreadIds: [],
@@ -313,16 +296,15 @@ export class CollabManager {
       });
       await this.emitToolItem("item/started", req.parentThreadId, startedItem);
 
-      await this.beginAgentTurn(agent, promptPreview);
+      await this.requireAgentRuntime(agent.agentId).beginTurn(promptPreview);
 
       startedItem.status = "completed";
       startedItem.receiverThreadIds = [agent.threadId];
       startedItem.agentsStates = this.collectAgentStates([agentId]);
       await this.emitToolItem("item/completed", req.parentThreadId, startedItem);
 
-      this.transitionAgent(agentId, "running", null);
-      void this.startPrompt(
-        agentId,
+      this.requireAgentRuntime(agentId).transition("running", null);
+      void this.requireAgentRuntime(agentId).startPrompt(
         req.items ?? [{ type: "text", text: req.message, text_elements: [] }]
       );
 
@@ -331,6 +313,7 @@ export class CollabManager {
         nickname,
       };
     } catch (error) {
+      this.agentRuntimes.get(agentId)?.unbind();
       this.agents.delete(agentId);
       this.agentRuntimes.delete(agentId);
       const backend = this.requireBackend(backendType);
@@ -381,14 +364,13 @@ export class CollabManager {
         threadHandle: agent.sessionId,
         turnId: runtime.activeTurnId,
       });
-      this.transitionAgent(agent.agentId, "interrupted", agent.completionMessage);
+      this.requireAgentRuntime(agent.agentId).transition("interrupted", agent.completionMessage);
     }
 
     const submissionId = randomUUID();
-    await this.beginAgentTurn(agent, promptPreview);
-    this.transitionAgent(agent.agentId, "running", null);
-    void this.startPrompt(
-      agent.agentId,
+    await this.requireAgentRuntime(agent.agentId).beginTurn(promptPreview);
+    this.requireAgentRuntime(agent.agentId).transition("running", null);
+    void this.requireAgentRuntime(agent.agentId).startPrompt(
       req.items ?? [{ type: "text", text: req.message, text_elements: [] }]
     );
 
@@ -418,41 +400,7 @@ export class CollabManager {
     });
     await this.emitToolItem("item/started", req.parentThreadId, item);
 
-    const immediate = this.collectFinalStatuses(req.ids);
-    if (Object.keys(immediate).length > 0) {
-      item.status = "completed";
-      item.agentsStates = this.collectAgentStates(req.ids);
-      await this.emitToolItem("item/completed", req.parentThreadId, item);
-      const response = {
-        status: immediate,
-        messages: this.collectFinalMessages(req.ids),
-        timed_out: false,
-      };
-      return response;
-    }
-
-    const response = await new Promise<CollabWaitResponse>((resolve) => {
-      const waiterId = randomUUID();
-      const timeoutMs = this.normalizeTimeout(req.timeout_ms);
-      const waiter: CollabWaiter = {
-        ids: [...req.ids],
-        resolve: (result) => {
-          if (waiter.timer) {
-            clearTimeout(waiter.timer);
-          }
-          this.waiters.delete(waiterId);
-          resolve(result);
-        },
-        timer: setTimeout(() => {
-          waiter.resolve({
-            status: this.collectFinalStatuses(req.ids),
-            messages: this.collectFinalMessages(req.ids),
-            timed_out: true,
-          });
-        }, timeoutMs),
-      };
-      this.waiters.set(waiterId, waiter);
-    });
+    const response = await this.waits.wait(req.ids, req.timeout_ms);
 
     item.status = "completed";
     item.agentsStates = this.collectAgentStates(req.ids);
@@ -506,7 +454,7 @@ export class CollabManager {
     await this.emitToolItem("item/started", req.parentThreadId, item);
 
     const runtime = this.agentRuntimes.get(agent.agentId);
-    runtime?.subscription?.dispose();
+    runtime?.unbind();
     let sessionId = agent.sessionId;
     let backendType = runtime?.backendType ?? this.resolveThreadBackendType(agent.threadId);
     const backend = this.requireBackend(backendType);
@@ -554,10 +502,8 @@ export class CollabManager {
       sessionId = started.threadHandle;
     }
 
-    agent.sessionId = sessionId;
     backendType = runtime?.backendType ?? backendType;
-    this.subscribeToAgent(agent, backendType);
-    this.transitionAgent(agent.agentId, "running", agent.completionMessage);
+    this.requireAgentRuntime(agent.agentId).resume(sessionId, backendType);
 
     item.status = "completed";
     item.agentsStates = this.collectAgentStates([agent.agentId]);
@@ -578,14 +524,7 @@ export class CollabManager {
   async dispose(): Promise<void> {
     await Promise.all([...this.agents.values()].map((agent) => this.shutdownAgent(agent.agentId)));
 
-    for (const waiter of this.waiters.values()) {
-      waiter.resolve({
-        status: {},
-        messages: {},
-        timed_out: true,
-      });
-    }
-    this.waiters.clear();
+    this.waits.dispose();
   }
 
   private assignNickname(): string {
@@ -652,22 +591,6 @@ export class CollabManager {
     return agent;
   }
 
-  private subscribeToAgent(agent: CollabAgent, backendType: string): void {
-    const existing = this.agentRuntimes.get(agent.agentId);
-    existing?.subscription?.dispose();
-    const runtime: CollabAgentRuntime = existing ?? {
-      backendType,
-      subscription: null,
-      activeTurnId: null,
-      lastAssistantText: "",
-    };
-    runtime.backendType = backendType;
-    runtime.subscription = this.requireBackend(backendType).onEvent(agent.sessionId, (event) => {
-      void this.handleChildEvent(agent.agentId, event);
-    });
-    this.agentRuntimes.set(agent.agentId, runtime);
-  }
-
   getAgentByThreadId(threadId: string): CollabAgent | null {
     return [...this.agents.values()].find((agent) => agent.threadId === threadId) ?? null;
   }
@@ -693,9 +616,7 @@ export class CollabManager {
     if (!agent) {
       return;
     }
-    agent.sessionId = sessionId;
-    this.subscribeToAgent(agent, backendType);
-    this.transitionAgent(agent.agentId, "running", agent.completionMessage);
+    this.requireAgentRuntime(agent.agentId).resume(sessionId, backendType);
   }
 
   syncExternalTurnStart(threadId: string, turnId: string): void {
@@ -705,9 +626,7 @@ export class CollabManager {
       return;
     }
 
-    runtime.activeTurnId = turnId;
-    runtime.lastAssistantText = "";
-    this.transitionAgent(agent.agentId, "running", null);
+    runtime.syncTurnStart(turnId);
   }
 
   syncExternalTurnInterrupt(threadId: string): void {
@@ -717,160 +636,7 @@ export class CollabManager {
       return;
     }
 
-    runtime.activeTurnId = null;
-    runtime.lastAssistantText = "";
-    this.transitionAgent(agent.agentId, "interrupted", null);
-  }
-
-  private async beginAgentTurn(agent: CollabAgent, message: string): Promise<string> {
-    const runtime = this.agentRuntimes.get(agent.agentId);
-    if (!runtime) {
-      throw new Error(`Missing runtime for agent ${agent.agentId}`);
-    }
-    const turnId = this.startChildTurn
-      ? await this.startChildTurn({ agent: structuredClone(agent), message })
-      : randomUUID();
-    runtime.activeTurnId = turnId;
-    runtime.lastAssistantText = "";
-    return turnId;
-  }
-
-  private async startPrompt(agentId: string, input: readonly UserInput[]): Promise<void> {
-    const agent = this.agents.get(agentId);
-    const runtime = this.agentRuntimes.get(agentId);
-    if (!agent || !runtime?.activeTurnId) {
-      return;
-    }
-
-    try {
-      const backend = this.requireBackend(runtime.backendType);
-      const childContext = this.resolveThreadExecutionContext(agent.threadId);
-      const parentContext = this.resolveThreadExecutionContext(agent.parentThreadId);
-      const context = childContext ?? parentContext;
-      const selectedModel = childContext?.model
-        ? (this.backendRouter.parseModelSelection(childContext.model)?.selection.rawModelId ??
-          childContext.model)
-        : null;
-      await backend.turnStart({
-        threadId: agent.threadId,
-        threadHandle: agent.sessionId,
-        turnId: runtime.activeTurnId,
-        cwd: context?.cwd ?? process.cwd(),
-        input: [...input],
-        model: selectedModel,
-        reasoningEffort: childContext?.reasoningEffort ?? null,
-        approvalPolicy: context?.approvalPolicy ?? null,
-        approvalsReviewer: context?.approvalsReviewer ?? null,
-        sandboxPolicy: context?.sandboxPolicy ?? null,
-        serviceTier: context?.serviceTier ?? null,
-        summary: context?.summary ?? null,
-        personality: context?.personality ?? null,
-        collaborationMode: context?.collaborationMode ?? null,
-        emitUserMessage: true,
-      });
-    } catch (error) {
-      this.transitionAgent(
-        agentId,
-        "errored",
-        error instanceof Error ? error.message : String(error)
-      );
-      this.resolveWaiters(agentId);
-    }
-  }
-
-  private async handleChildEvent(agentId: string, event: BackendAppServerEvent): Promise<void> {
-    const agent = this.agents.get(agentId);
-    const runtime = this.agentRuntimes.get(agentId);
-    if (!agent || !runtime) {
-      return;
-    }
-
-    void this.onChildAgentEvent?.({ agent: structuredClone(agent), event });
-
-    if (event.kind === "notification") {
-      if (
-        event.method === "item/agentMessage/delta" &&
-        typeof (event.params as { delta?: unknown }).delta === "string"
-      ) {
-        runtime.lastAssistantText += (event.params as { delta: string }).delta;
-        return;
-      }
-
-      if (event.method === "item/completed") {
-        const item = (event.params as { item?: { type?: unknown; text?: unknown } }).item;
-        if (
-          item?.type === "agentMessage" &&
-          typeof item.text === "string" &&
-          item.text.length > 0
-        ) {
-          runtime.lastAssistantText = item.text;
-        }
-      }
-
-      if (event.method === "turn/completed") {
-        const params = event.params as {
-          turn?: {
-            status?: unknown;
-            error?: { message?: unknown };
-            items?: Array<{ type?: unknown; text?: unknown }>;
-          };
-        };
-        if (!runtime.lastAssistantText && Array.isArray(params.turn?.items)) {
-          const latestAgentMessage = [...params.turn.items]
-            .reverse()
-            .find((item) => item?.type === "agentMessage" && typeof item?.text === "string");
-          if (latestAgentMessage && typeof latestAgentMessage.text === "string") {
-            runtime.lastAssistantText = latestAgentMessage.text;
-          }
-        }
-        const status = params.turn?.status;
-        runtime.activeTurnId = null;
-        if (status === "completed" || status === "interrupted") {
-          this.transitionAgent(agentId, "completed", runtime.lastAssistantText || null);
-        } else if (status === "failed") {
-          const message =
-            typeof params.turn?.error?.message === "string"
-              ? params.turn.error.message
-              : runtime.lastAssistantText || "Child agent turn failed";
-          this.transitionAgent(agentId, "errored", message);
-        } else {
-          this.transitionAgent(agentId, "completed", runtime.lastAssistantText || null);
-        }
-        this.resolveWaiters(agentId);
-      }
-      return;
-    }
-
-    if (event.kind === "error" || event.kind === "disconnect") {
-      runtime.activeTurnId = null;
-      this.transitionAgent(
-        agentId,
-        "errored",
-        event.kind === "error" ? event.message : `Backend disconnected: ${event.message}`
-      );
-      this.resolveWaiters(agentId);
-    }
-  }
-
-  private transitionAgent(
-    agentId: string,
-    status: CollabAgentStatus,
-    message: string | null
-  ): void {
-    const agent = this.agents.get(agentId);
-    const runtime = this.agentRuntimes.get(agentId);
-    if (!agent) {
-      return;
-    }
-    agent.status = status;
-    agent.completionMessage = message;
-    void this.onChildAgentStatusChanged?.({
-      agent: {
-        ...structuredClone(agent),
-        backendType: runtime?.backendType ?? "unknown",
-        threadHandle: agent.sessionId,
-      },
-    });
+    runtime.syncTurnInterrupt();
   }
 
   private async shutdownAgent(agentId: string): Promise<void> {
@@ -883,67 +649,10 @@ export class CollabManager {
     try {
       await this.shutdownByParent(agent.threadId);
 
-      const runtime = this.agentRuntimes.get(agent.agentId);
-      if (runtime?.activeTurnId) {
-        await this.requireBackend(runtime.backendType)
-          .turnInterrupt({
-            threadId: agent.threadId,
-            threadHandle: agent.sessionId,
-            turnId: runtime.activeTurnId,
-          })
-          .catch(() => {});
-      }
-      runtime?.subscription?.dispose();
-      if (runtime) {
-        runtime.subscription = null;
-        runtime.activeTurnId = null;
-        runtime.lastAssistantText = "";
-      }
-      if (runtime) {
-        await this.requireBackend(runtime.backendType)
-          .threadArchive({
-            threadId: agent.threadId,
-            threadHandle: agent.sessionId,
-          })
-          .catch(() => {});
-      }
-      this.transitionAgent(agent.agentId, "shutdown", agent.completionMessage);
-      this.resolveWaiters(agent.agentId);
+      await this.agentRuntimes.get(agent.agentId)?.shutdown();
     } finally {
       this.shuttingDownAgentIds.delete(agentId);
     }
-  }
-
-  private resolveWaiters(agentId: string): void {
-    const agent = this.agents.get(agentId);
-    if (!agent || !this.isFinalStatus(agent.status)) {
-      return;
-    }
-
-    for (const waiter of this.waiters.values()) {
-      if (!waiter.ids.includes(agentId)) {
-        continue;
-      }
-      waiter.resolve({
-        status: this.collectFinalStatuses(waiter.ids),
-        messages: this.collectFinalMessages(waiter.ids),
-        timed_out: false,
-      });
-    }
-  }
-
-  private isFinalStatus(status: CollabAgentStatus): boolean {
-    return (
-      status === "completed" ||
-      status === "errored" ||
-      status === "shutdown" ||
-      status === "notFound"
-    );
-  }
-
-  private normalizeTimeout(timeoutMs: number | undefined): number {
-    const requested = timeoutMs ?? this.config.defaultTimeoutMs;
-    return Math.min(this.config.maxTimeoutMs, Math.max(this.config.minTimeoutMs, requested));
   }
 
   private createToolItem(
@@ -1005,37 +714,12 @@ export class CollabManager {
     return states;
   }
 
-  private collectFinalStatuses(agentIds: readonly string[]): Record<string, CollabAgentStatus> {
-    const states: Record<string, CollabAgentStatus> = {};
-    for (const agentId of agentIds) {
-      const agent = this.agents.get(agentId);
-      if (!agent) {
-        states[agentId] = "notFound";
-        continue;
-      }
-      if (this.isFinalStatus(agent.status)) {
-        states[agentId] = agent.status;
-      }
-    }
-    return states;
-  }
-
-  private collectFinalMessages(agentIds: readonly string[]): Record<string, string | null> {
-    const messages: Record<string, string | null> = {};
-    for (const agentId of agentIds) {
-      const agent = this.agents.get(agentId);
-      if (!agent) {
-        messages[agentId] = null;
-        continue;
-      }
-      if (this.isFinalStatus(agent.status)) {
-        messages[agentId] = agent.completionMessage;
-      }
-    }
-    return messages;
-  }
-
   private requireBackend(backendType: string): IBackend {
     return this.backendRouter.requireBackend(backendType);
+  }
+  private requireAgentRuntime(agentId: string): CollabAgentSession {
+    const runtime = this.agentRuntimes.get(agentId);
+    if (!runtime) throw new Error(`Missing runtime for agent ${agentId}`);
+    return runtime;
   }
 }

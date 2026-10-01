@@ -42,6 +42,8 @@ The default subprocess is `pi --mode rpc`. PATH wrappers are respected, includin
 
 Pi RPC cannot render custom terminal UI, keybindings, terminal widgets, or themes. Those features remain TUI-only. Desktop skill and plugin listings are not an inventory of your Pi extensions. An empty listing does not disable them.
 
+Tools supplied by desktop plugins are not forwarded into Pi. Ordinary text the GUI includes in a prompt reaches Pi, but plugin tool definitions and calls need a bridge that Codapter does not yet implement.
+
 Codapter's optional `--collab` extension adds adapter-managed child threads. It is separate from any sub-agent extension you already use in Pi, and is off by default. Native Pi sub-agent tools remain native.
 
 **Trust boundary:** Pi tools keep their existing host permissions. Desktop sandbox and approval labels do not create a sandbox around Pi. Adapter-native `command/exec` also runs on the host. Use only trusted local clients or an authenticated SSH tunnel.
@@ -111,7 +113,7 @@ The ordinary suite makes no inference calls. The opt-in live test uses your inst
 - **Separate test state:** set `CODAPTER_STATE_DIR` and `CODAPTER_CONFIG_FILE`. Do not delete your real thread registry to troubleshoot a fresh thread.
 - **Debugging:** pass `--remote-debugging-port=9233` to the launcher when needed. Logs contain prompts, file contents, and tool output. Do not publish them unredacted.
 
-Unsupported surfaces return explicit errors or empty capability listings. Native Codex WebSocket proxying, PTY command execution, desktop worktree management, MCP management, and realtime voice are not implemented. This does not prevent Pi extensions from providing their own tools through Pi.
+Native Codex WebSocket proxying, PTY command execution, desktop worktree management, MCP management, and realtime voice are not implemented. This does not prevent Pi extensions from providing their own tools through Pi. See [API mapping](docs/api-mapping.md) for the supported surface.
 
 ## License
 

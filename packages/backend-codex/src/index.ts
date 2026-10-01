@@ -1,5 +1,3 @@
-import { type ChildProcessWithoutNullStreams, spawn } from "node:child_process";
-import { createInterface } from "node:readline";
 import type {
   BackendAppServerEvent,
   BackendModelSummary,
@@ -19,50 +17,17 @@ import type {
   BackendTurnStartResult,
   Disposable,
   IBackend,
-  JsonRpcId,
   ParsedBackendSelection,
 } from "@codapter/core";
 import { BackendThreadEventBuffer, parseBackendModelId } from "@codapter/core";
 import { parseModelCatalog } from "./model-catalog.js";
+import {
+  type CodexBackendOptions,
+  type CodexRpcEvent,
+  CodexRpcTransport,
+} from "./rpc-transport.js";
 
-interface JsonRpcRequest {
-  readonly id: JsonRpcId;
-  readonly method: string;
-  readonly params?: unknown;
-}
-
-interface JsonRpcNotification {
-  readonly method: string;
-  readonly params?: unknown;
-}
-
-interface PendingRequest {
-  resolve(value: unknown): void;
-  reject(error: Error): void;
-}
-
-export interface CodexBackendOptions {
-  readonly command?: string;
-  readonly args?: readonly string[];
-  readonly env?: NodeJS.ProcessEnv;
-  readonly cwd?: string;
-  readonly transport?: "stdio" | "websocket";
-  readonly websocketUrl?: string;
-  readonly stderr?: NodeJS.WritableStream | null;
-}
-
-const DEFAULT_INITIALIZE_PARAMS = {
-  clientInfo: {
-    name: "codapter-backend-codex",
-    title: "codapter backend codex",
-    version: "0.0.1",
-  },
-  capabilities: {
-    experimentalApi: true,
-    optOutNotificationMethods: [],
-  },
-};
-const WEBSOCKET_DEFERRED_MESSAGE = "Codex websocket transport is deferred in this implementation";
+export type { CodexBackendOptions } from "./rpc-transport.js";
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null;
@@ -119,122 +84,32 @@ function rewriteInboundModelFields(value: unknown): unknown {
 export class CodexBackend implements IBackend {
   public readonly backendType = "codex";
 
-  private readonly command: string;
-  private readonly args: readonly string[];
-  private readonly env: NodeJS.ProcessEnv;
-  private readonly cwd: string;
-  private readonly transport: "stdio" | "websocket";
-  private readonly websocketUrl: string | null;
-  private readonly stderrSink: NodeJS.WritableStream | null;
-  private readonly pending = new Map<JsonRpcId, PendingRequest>();
+  private readonly rpc: CodexRpcTransport;
   private readonly eventBuffer = new BackendThreadEventBuffer();
   private readonly knownThreadHandles = new Set<string>();
-  private process: ChildProcessWithoutNullStreams | null = null;
-  private initialized = false;
-  private alive = false;
-  private disposed = false;
-  private requestCounter = 0;
-  private initError: string | null = null;
-  private recentStderr = "";
-  private processFailureHandled = false;
 
   constructor(options: CodexBackendOptions = {}) {
-    this.command = options.command ?? "codex";
-    this.args = options.args ?? ["app-server"];
-    this.env = options.env ?? process.env;
-    this.cwd = options.cwd ?? process.cwd();
-    this.transport = options.transport ?? "stdio";
-    this.websocketUrl = options.websocketUrl ?? null;
-    this.stderrSink = options.stderr ?? null;
+    this.rpc = new CodexRpcTransport(
+      options,
+      (event) => this.handleRpcEvent(event),
+      (message) => {
+        for (const threadHandle of this.knownThreadHandles) {
+          this.eventBuffer.emit(threadHandle, { kind: "disconnect", threadHandle, message });
+        }
+      }
+    );
   }
 
-  async initialize(): Promise<void> {
-    if (this.initialized) {
-      return;
-    }
-    if (this.transport === "websocket") {
-      this.initError =
-        this.websocketUrl && this.websocketUrl.length > 0
-          ? `${WEBSOCKET_DEFERRED_MESSAGE}: ${this.websocketUrl}`
-          : WEBSOCKET_DEFERRED_MESSAGE;
-      throw new Error(this.initError);
-    }
-
-    this.disposed = false;
-    this.processFailureHandled = false;
-    this.recentStderr = "";
-    this.process = spawn(this.command, this.args as string[], {
-      cwd: this.cwd,
-      env: { ...process.env, ...this.env },
-      stdio: ["pipe", "pipe", "pipe"],
-    });
-    this.process.stdout.setEncoding("utf8");
-    this.process.stderr.setEncoding("utf8");
-
-    const lineReader = createInterface({
-      input: this.process.stdout,
-      crlfDelay: Number.POSITIVE_INFINITY,
-    });
-    lineReader.on("line", (line) => {
-      this.handleLine(line);
-    });
-
-    const onProcessFailure = (message: string) => {
-      this.handleProcessFailure(message);
-    };
-
-    const spawnError = new Promise<never>((_, reject) => {
-      this.process?.once("error", (error) => {
-        const wrapped = new Error(
-          `Failed to spawn Codex app-server process: ${error instanceof Error ? error.message : String(error)}`
-        );
-        onProcessFailure(wrapped.message);
-        reject(wrapped);
-      });
-    });
-
-    this.process.stderr.on("data", (chunk: string | Buffer) => {
-      const text = typeof chunk === "string" ? chunk : chunk.toString("utf8");
-      this.appendStderr(text);
-      this.stderrSink?.write(text);
-    });
-
-    this.process.once("exit", () => {
-      onProcessFailure("Codex app-server process exited");
-    });
-
-    try {
-      await Promise.race([this.sendRequest("initialize", DEFAULT_INITIALIZE_PARAMS), spawnError]);
-      this.sendNotification("initialized");
-      this.alive = true;
-      this.initialized = true;
-      this.initError = null;
-    } catch (error) {
-      this.alive = false;
-      this.initialized = false;
-      this.initError = error instanceof Error ? error.message : String(error);
-      await this.dispose();
-      throw error;
-    }
+  initialize(): Promise<void> {
+    return this.rpc.initialize();
   }
 
-  async dispose(): Promise<void> {
-    this.disposed = true;
-    this.alive = false;
-    this.initialized = false;
-    if (this.process) {
-      this.process.kill("SIGTERM");
-      await new Promise<void>((resolve) => {
-        this.process?.once("exit", () => resolve());
-        setTimeout(resolve, 2_000).unref();
-      });
-    }
-    this.process = null;
-    this.pending.clear();
+  dispose(): Promise<void> {
+    return this.rpc.dispose();
   }
 
   isAlive(): boolean {
-    return this.alive && !this.disposed;
+    return this.rpc.isAlive();
   }
 
   parseModelSelection(model: string | null | undefined): ParsedBackendSelection | null {
@@ -255,12 +130,11 @@ export class CodexBackend implements IBackend {
   }
 
   async listModels(): Promise<readonly BackendModelSummary[]> {
-    this.assertReady();
     const models: unknown[] = [];
     let cursor: string | null = null;
     const seenCursors = new Set<string>();
     do {
-      const response = await this.sendRequest("model/list", { cursor, includeHidden: true });
+      const response = await this.rpc.request("model/list", { cursor, includeHidden: true });
       if (!isRecord(response) || !Array.isArray(response.data)) {
         throw new Error("Invalid Codex model/list response");
       }
@@ -274,8 +148,7 @@ export class CodexBackend implements IBackend {
   }
 
   async threadStart(input: BackendThreadStartInput): Promise<BackendThreadStartResult> {
-    this.assertReady();
-    const response = (await this.sendRequest("thread/start", {
+    const response = (await this.rpc.request("thread/start", {
       model: input.model,
       cwd: input.cwd,
       approvalPolicy: input.approvalPolicy ?? null,
@@ -305,8 +178,7 @@ export class CodexBackend implements IBackend {
   }
 
   async threadResume(input: BackendThreadResumeInput): Promise<BackendThreadResumeResult> {
-    this.assertReady();
-    const response = (await this.sendRequest("thread/resume", {
+    const response = (await this.rpc.request("thread/resume", {
       threadId: input.threadHandle,
       cwd: input.cwd,
       model: input.model,
@@ -332,8 +204,7 @@ export class CodexBackend implements IBackend {
   }
 
   async threadFork(input: BackendThreadForkInput): Promise<BackendThreadForkResult> {
-    this.assertReady();
-    const response = (await this.sendRequest("thread/fork", {
+    const response = (await this.rpc.request("thread/fork", {
       threadId: input.sourceThreadHandle,
       cwd: input.cwd,
       model: input.model,
@@ -362,8 +233,7 @@ export class CodexBackend implements IBackend {
   }
 
   async threadRead(input: BackendThreadReadInput): Promise<BackendThreadReadResult> {
-    this.assertReady();
-    const response = (await this.sendRequest("thread/read", {
+    const response = (await this.rpc.request("thread/read", {
       threadId: input.threadHandle,
       includeTurns: input.includeTurns,
     })) as {
@@ -402,21 +272,18 @@ export class CodexBackend implements IBackend {
   }
 
   async threadArchive(input: BackendThreadArchiveInput): Promise<void> {
-    this.assertReady();
-    await this.sendRequest("thread/archive", { threadId: input.threadHandle });
+    await this.rpc.request("thread/archive", { threadId: input.threadHandle });
   }
 
   async threadSetName(input: BackendThreadSetNameInput): Promise<void> {
-    this.assertReady();
-    await this.sendRequest("thread/name/set", {
+    await this.rpc.request("thread/name/set", {
       threadId: input.threadHandle,
       name: input.name,
     });
   }
 
   async turnStart(input: BackendTurnStartInput): Promise<BackendTurnStartResult> {
-    this.assertReady();
-    const response = (await this.sendRequest("turn/start", {
+    const response = (await this.rpc.request("turn/start", {
       threadId: input.threadHandle,
       input: input.input,
       cwd: input.cwd,
@@ -438,173 +305,32 @@ export class CodexBackend implements IBackend {
   }
 
   async turnInterrupt(input: BackendTurnInterruptInput): Promise<void> {
-    this.assertReady();
-    await this.sendRequest("turn/interrupt", {
+    await this.rpc.request("turn/interrupt", {
       threadId: input.threadHandle,
       turnId: input.turnId,
     });
   }
 
   async resolveServerRequest(input: BackendResolveServerRequestInput): Promise<void> {
-    this.assertReady();
-    this.sendRaw({
-      id: input.requestId,
-      ...(isRecord(input.response) && "error" in input.response
-        ? { error: (input.response as { error: unknown }).error }
-        : { result: (input.response as { result?: unknown }).result }),
-    });
+    this.rpc.respond(input.requestId, input.response);
   }
 
   onEvent(threadHandle: string, listener: (event: BackendAppServerEvent) => void): Disposable {
     return this.eventBuffer.subscribe(threadHandle, listener);
   }
 
-  private assertReady(): void {
-    if (this.transport === "websocket") {
-      throw new Error(WEBSOCKET_DEFERRED_MESSAGE);
-    }
-    if (!this.isAlive()) {
-      throw new Error(this.initError ?? "Codex backend is unavailable");
-    }
-  }
-
-  private nextRequestId(): number {
-    this.requestCounter += 1;
-    return this.requestCounter;
-  }
-
-  private async sendRequest(method: string, params: unknown): Promise<unknown> {
-    const id = this.nextRequestId();
-    this.sendRaw({ id, method, params } satisfies JsonRpcRequest);
-    return await new Promise((resolve, reject) => {
-      this.pending.set(id, {
-        resolve,
-        reject,
-      });
+  private handleRpcEvent(event: CodexRpcEvent): void {
+    const threadHandle = inferThreadHandle(event.method, event.params);
+    if (!threadHandle) return;
+    this.knownThreadHandles.add(threadHandle);
+    this.eventBuffer.emit(threadHandle, {
+      ...(event.id === undefined
+        ? { kind: "notification" }
+        : { kind: "serverRequest", requestId: event.id }),
+      threadHandle,
+      method: event.method,
+      params: rewriteInboundModelFields(event.params),
     });
-  }
-
-  private sendNotification(method: string, params?: unknown): void {
-    this.sendRaw(
-      params === undefined ? { method } : ({ method, params } satisfies JsonRpcNotification)
-    );
-  }
-
-  private sendRaw(payload: Record<string, unknown>): void {
-    if (!this.process) {
-      throw new Error("Codex process is not running");
-    }
-    this.process.stdin.write(`${JSON.stringify(payload)}\n`);
-  }
-
-  private appendStderr(text: string): void {
-    if (text.length === 0) {
-      return;
-    }
-    const combined = `${this.recentStderr}${text}`;
-    this.recentStderr = combined.slice(-8_000);
-  }
-
-  private withRecentStderr(message: string): string {
-    const stderr = this.recentStderr.trim();
-    if (stderr.length === 0) {
-      return message;
-    }
-    return `${message}; recent stderr: ${stderr}`;
-  }
-
-  private handleProcessFailure(message: string): void {
-    if (this.processFailureHandled) {
-      return;
-    }
-    this.processFailureHandled = true;
-    this.alive = false;
-
-    const nextMessage = this.withRecentStderr(message);
-    if (!this.disposed && !this.initError) {
-      this.initError = nextMessage;
-    }
-
-    for (const [id, pending] of this.pending) {
-      this.pending.delete(id);
-      pending.reject(new Error(this.initError ?? nextMessage));
-    }
-    for (const threadHandle of this.knownThreadHandles) {
-      this.eventBuffer.emit(threadHandle, {
-        kind: "disconnect",
-        threadHandle,
-        message: this.initError ?? nextMessage,
-      });
-    }
-  }
-
-  private handleLine(line: string): void {
-    if (!line.trim()) {
-      return;
-    }
-
-    let parsed: unknown;
-    try {
-      parsed = JSON.parse(line);
-    } catch {
-      return;
-    }
-    if (!isRecord(parsed)) {
-      return;
-    }
-
-    if ("id" in parsed && ("result" in parsed || "error" in parsed)) {
-      const id = parsed.id;
-      if (typeof id !== "string" && typeof id !== "number") {
-        return;
-      }
-      const pending = this.pending.get(id);
-      if (!pending) {
-        return;
-      }
-      this.pending.delete(id);
-      if ("error" in parsed && parsed.error !== undefined) {
-        pending.reject(new Error(JSON.stringify(parsed.error)));
-        return;
-      }
-      pending.resolve(parsed.result);
-      return;
-    }
-
-    if (
-      "id" in parsed &&
-      (typeof parsed.id === "string" || typeof parsed.id === "number") &&
-      "method" in parsed &&
-      typeof parsed.method === "string"
-    ) {
-      const threadHandle = inferThreadHandle(parsed.method, parsed.params);
-      if (!threadHandle) {
-        return;
-      }
-      this.knownThreadHandles.add(threadHandle);
-      this.eventBuffer.emit(threadHandle, {
-        kind: "serverRequest",
-        threadHandle,
-        requestId: parsed.id,
-        method: parsed.method,
-        params: rewriteInboundModelFields(parsed.params),
-      });
-      return;
-    }
-
-    if ("method" in parsed && typeof parsed.method === "string") {
-      const threadHandle = inferThreadHandle(parsed.method, parsed.params);
-      if (!threadHandle) {
-        return;
-      }
-      this.knownThreadHandles.add(threadHandle);
-      this.eventBuffer.emit(threadHandle, {
-        kind: "notification",
-        threadHandle,
-        method: parsed.method,
-        params: rewriteInboundModelFields(parsed.params),
-      });
-    }
   }
 }
 

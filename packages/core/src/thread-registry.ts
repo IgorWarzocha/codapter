@@ -164,6 +164,8 @@ export class ThreadRegistry {
   private readonly logger: ThreadRegistryLogger;
   private readonly entries = new Map<string, ThreadRegistryEntry>();
   private loaded = false;
+  private loading: Promise<void> | null = null;
+  private pendingPersistence: Promise<void> = Promise.resolve();
 
   constructor(filePath = defaultStateFilePath(), logger: ThreadRegistryLogger = defaultLogger()) {
     this.filePath = filePath;
@@ -178,7 +180,15 @@ export class ThreadRegistry {
     if (this.loaded) {
       return;
     }
+    if (!this.loading) {
+      this.loading = this.loadFile().finally(() => {
+        this.loading = null;
+      });
+    }
+    await this.loading;
+  }
 
+  private async loadFile(): Promise<void> {
     let raw: string;
     try {
       raw = await readFile(this.filePath, "utf8");
@@ -326,24 +336,28 @@ export class ThreadRegistry {
     await this.persist();
   }
 
-  private async persist(): Promise<void> {
+  private persist(): Promise<void> {
     const payload: ThreadRegistryFile = {
       threads: [...this.entries.values()],
     };
+    const serialized = `${JSON.stringify(payload, null, 2)}\n`;
+    // Atomic rename is not enough: concurrent snapshots must reach disk in mutation order.
+    const write = this.pendingPersistence
+      .catch(() => {})
+      .then(() => this.writeSnapshot(serialized));
+    this.pendingPersistence = write;
+    return write;
+  }
 
+  private async writeSnapshot(serialized: string): Promise<void> {
     await mkdir(dirname(this.filePath), { recursive: true, mode: 0o700 });
 
-    const tempPath = `${this.filePath}.${process.pid}.${Date.now()}.tmp`;
-    await writeFile(tempPath, `${JSON.stringify(payload, null, 2)}\n`, {
-      encoding: "utf8",
-      mode: 0o600,
-    });
-    await rename(tempPath, this.filePath);
-
+    const tempPath = `${this.filePath}.${randomUUID()}.tmp`;
     try {
-      await rm(tempPath, { force: true });
-    } catch {
-      // rename already moved the temp file; ignore cleanup races
+      await writeFile(tempPath, serialized, { encoding: "utf8", mode: 0o600 });
+      await rename(tempPath, this.filePath);
+    } finally {
+      await rm(tempPath, { force: true }).catch(() => {});
     }
   }
 }

@@ -1,0 +1,6 @@
+- `protocol.ts` is a maintained subset. Verify changed wire fields against the installed `codex app-server generate-ts` or `generate-json-schema`, not against our fixtures. Do not patch installed artifacts.
+- Backend type and opaque session handle are separate persisted identities. Pi model IDs are `pi::<provider>/<model>`. Native Codex IDs stay unprefixed. A loaded thread cannot move between backends.
+- Direct backend subscriptions and collab child subscriptions are mutually exclusive. Preserve per-thread event ordering and detach subscriptions on partial resume, fork, and spawn failures.
+- GUI server-request IDs are connection-local correlation IDs, not backend request IDs. Preserve arbitrary request methods and both result and error responses. Thread notification unsubscribe must not discard the response route.
+- Execution settings are cloned thread snapshots, including child inheritance. Do not reconstruct approval, sandbox, service-tier, or collaboration settings from model defaults.
+- Registry atomic rename does not serialize concurrent mutations. Keep initial loading shared and disk snapshots ordered. Production-path regressions belong in `test/app-server*.test.ts` and `test/collab-manager.test.ts`, not mock-only tests of extracted owners.

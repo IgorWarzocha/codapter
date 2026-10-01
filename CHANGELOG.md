@@ -19,6 +19,7 @@
 - Updated TypeScript to 7, Biome to 2, Vitest to 5, and reviewed runtime and build dependencies.
 - Separated CLI transports, Pi RPC lifecycle, history translation, model catalogs, and account state into focused owners.
 - Aligned bootstrap, model metadata, thread serialization, and native input handling with Codex app-server 0.159.3.
+- Separated thread sessions, subscriptions, turn submission, native thread mirroring, server-request correlation, child-agent waits, and backend process lifetimes. Added local agent guidance at the corresponding package and tooling boundaries.
 
 ### Fixed
 
@@ -28,6 +29,11 @@
 - Fixed partial-startup cleanup, idle reattachment, session-state write races, cancellation, and connected-listener shutdown.
 - Accepted current Desktop config arguments without replacing Pi extension settings or logging sensitive values.
 - Unified CLI and handshake versions under one release-owned constant.
+- Cancelled native Codex pending RPCs promptly on disposal and terminated unresponsive child processes.
+- Closed collaboration sockets on malformed replies and cancellation, and removed model-discovery calls that Pi's extension API does not provide.
+- Released subscriptions after failed thread setup and prevented stale queued events from reactivating archived or resumed threads.
+- Serialized thread-registry snapshots and initial loading to prevent concurrent write collisions and stale disk state.
+- Implemented paginated turn and item history required by current ChatGPT Desktop when reopening a conversation, and restored the required text metadata missing from Pi history.
 
 ### Removed
 

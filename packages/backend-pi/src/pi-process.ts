@@ -1,22 +1,23 @@
-import { randomUUID } from "node:crypto";
-import { appendFile, mkdir, readFile } from "node:fs/promises";
-import { dirname } from "node:path";
 import type {
-  BackendEvent,
   BackendImageInput,
   BackendMessage,
   BackendSessionLaunchConfig,
   BackendTokenUsage,
 } from "@codapter/core";
-import { assistantMessageText, mapBackendMessages, mapTokenUsage } from "./message-mapping.js";
+import { normalizeElicitationResponse } from "./extension-ui.js";
+import { convertImages } from "./image-input.js";
+import { mapBackendMessages, mapTokenUsage } from "./message-mapping.js";
 import {
   parseStateModelContextWindow,
   parseStateModelId,
   parseUpstreamModelFromResponse,
   type UpstreamModel,
 } from "./model-catalog.js";
+import { PiLogWriter } from "./process-log.js";
 import { type PiProcessResponse, PiRpcTransport } from "./rpc-transport.js";
-import type { PiBackendSessionRecord } from "./state-store.js";
+import { type PiProcessEvent, type PiRunState, PiTurnStream } from "./turn-stream.js";
+
+export type { PiProcessEvent } from "./turn-stream.js";
 
 export interface PiProcessLaunchOptions {
   readonly opaqueSessionId: string;
@@ -30,12 +31,6 @@ export interface PiProcessLaunchOptions {
   readonly requestTimeoutMs?: number;
 }
 
-interface PiImageContent {
-  readonly type: "image";
-  readonly data: string;
-  readonly mimeType: string;
-}
-
 export interface PiSessionStateSnapshot {
   readonly sessionId: string;
   readonly sessionFile: string | undefined;
@@ -45,117 +40,19 @@ export interface PiSessionStateSnapshot {
   readonly reasoningEffort: string | undefined;
 }
 
-interface UpstreamSessionState {
+interface UpstreamSessionState extends PiRunState {
   readonly sessionId: string;
   readonly sessionFile?: string;
   readonly sessionName?: string;
   readonly model?: UpstreamModel;
   readonly thinkingLevel?: string;
-  readonly isStreaming?: boolean;
-  readonly isCompacting?: boolean;
-  readonly pendingMessageCount?: number;
 }
-
-interface PiLogRecord {
-  readonly at: string;
-  readonly component: "pi-process";
-  readonly kind: "startup" | "shutdown" | "stdin" | "stdout" | "stderr" | "parsed-event";
-  readonly raw: string;
-  readonly eventType?: string;
-  readonly assistantEventType?: string;
-  readonly emittedType?: string;
-  readonly delta?: string;
-  readonly pid?: number;
-  readonly command?: string;
-  readonly sessionId?: string;
-  readonly exitCode?: number | null;
-  readonly signal?: NodeJS.Signals | null;
-}
-
-class PiLogWriter {
-  private pending: Promise<void> = Promise.resolve();
-  private failed = false;
-
-  constructor(private readonly filePath: string) {}
-
-  write(record: PiLogRecord): void {
-    if (this.failed) {
-      return;
-    }
-
-    const line = `${JSON.stringify(record)}\n`;
-    this.pending = this.pending.then(async () => {
-      await mkdir(dirname(this.filePath), { recursive: true });
-      await appendFile(this.filePath, line, "utf8");
-    });
-
-    void this.pending.catch(() => {
-      this.failed = true;
-    });
-  }
-
-  async flush(): Promise<void> {
-    try {
-      await this.pending;
-    } catch {
-      this.failed = true;
-    }
-  }
-}
-
-function isRecord(value: unknown): value is Record<string, unknown> {
-  return typeof value === "object" && value !== null;
-}
-
-function messageRole(message: unknown): string | null {
-  if (!isRecord(message) || typeof message.role !== "string") {
-    return null;
-  }
-  return message.role;
-}
-
-function messageStopReason(message: unknown): string | null {
-  if (!isRecord(message) || typeof message.stopReason !== "string") {
-    return null;
-  }
-  return message.stopReason;
-}
-
-function isToolUseAssistantMessage(message: unknown): boolean {
-  return messageRole(message) === "assistant" && messageStopReason(message) === "toolUse";
-}
-
-export function mapSessionRecordFromSnapshot(
-  opaqueSessionId: string,
-  snapshot: PiSessionStateSnapshot,
-  createdAt: string
-): PiBackendSessionRecord {
-  if (!snapshot.sessionFile) {
-    throw new Error("Pi session snapshot did not include a session file");
-  }
-
-  return {
-    opaqueSessionId,
-    sessionFile: snapshot.sessionFile,
-    sessionName: snapshot.sessionName ?? null,
-    modelId: snapshot.modelId ?? null,
-    createdAt,
-    updatedAt: new Date().toISOString(),
-  };
-}
-
-export type PiProcessEvent =
-  | BackendEvent
-  | { readonly type: "disconnect"; readonly message: string }
-  | { readonly type: "extension_error"; readonly message: string };
 
 export class PiProcessSession {
   private readonly opaqueSessionId: string;
   private readonly transport: PiRpcTransport;
   private readonly listeners = new Set<(event: PiProcessEvent) => void>();
-  private completion: { text?: string; error?: string } = {};
-  private currentTurnId: string | null = null;
-  private nativeRunStarted = false;
+  private readonly turnStream: PiTurnStream;
   private promptAbort: AbortController | null = null;
   private currentSessionFile: string | undefined;
   private currentSessionName: string | undefined;
@@ -196,25 +93,24 @@ export class PiProcessSession {
     if (!Number.isFinite(requestTimeoutMs) || requestTimeoutMs <= 0) {
       throw new Error("Pi requestTimeoutMs must be a positive finite number");
     }
+    this.turnStream = new PiTurnStream(
+      this.opaqueSessionId,
+      (event) => this.emit(event),
+      () => this.sendRequest<UpstreamSessionState>({ type: "get_state" }),
+      (turnId) => {
+        this.promptAbort = null;
+        this.emitTokenUsage(turnId);
+      },
+      this.logWriter
+    );
     this.transport = new PiRpcTransport({
       command,
       args,
       env,
       cwd,
       requestTimeoutMs,
-      onEvent: (event) => this.handleEvent(event),
-      onDisconnect: (error) => {
-        if (this.currentTurnId) {
-          this.emit({
-            sessionId: this.opaqueSessionId,
-            turnId: this.currentTurnId,
-            type: "error",
-            message: error.message,
-          });
-          this.currentTurnId = null;
-        }
-        this.emit({ type: "disconnect", message: error.message });
-      },
+      onEvent: (event) => this.turnStream.handleEvent(event),
+      onDisconnect: (error) => this.turnStream.disconnect(error),
       log: (kind, raw, pid) =>
         this.logWriter?.write({
           at: new Date().toISOString(),
@@ -285,7 +181,7 @@ export class PiProcessSession {
   }
 
   get isBusy(): boolean {
-    return this.currentTurnId !== null;
+    return this.turnStream.isBusy;
   }
 
   async setThinkingLevel(effort: string): Promise<void> {
@@ -301,27 +197,24 @@ export class PiProcessSession {
     message: string,
     images?: readonly BackendImageInput[]
   ): Promise<void> {
-    if (this.currentTurnId) throw new Error("Pi session already has an active turn");
-    this.currentTurnId = turnId;
-    this.nativeRunStarted = false;
+    this.turnStream.begin(turnId);
     const abort = new AbortController();
     this.promptAbort = abort;
-    this.completion = {};
     try {
       await this.ensureStarted();
       abort.signal.throwIfAborted();
-      const converted = await this.convertImages(images, abort.signal);
+      const converted = await convertImages(images, abort.signal);
       abort.signal.throwIfAborted();
       const response = await this.sendRequest<{ disposition?: string }>({
         type: "prompt",
         message,
         images: converted,
       });
-      if (response.data?.disposition === "handled" && this.currentTurnId === turnId) {
-        await this.finishHandledPromptIfIdle(turnId);
+      if (response.data?.disposition === "handled") {
+        await this.turnStream.finishHandledPromptIfIdle(turnId);
       }
     } catch (error) {
-      this.currentTurnId = null;
+      this.turnStream.reset();
       this.promptAbort = null;
       throw error;
     }
@@ -412,7 +305,7 @@ export class PiProcessSession {
   async dispose(): Promise<void> {
     this.promptAbort?.abort(new Error("Pi session has been disposed"));
     await this.transport.dispose();
-    this.currentTurnId = null;
+    this.turnStream.reset();
     this.promptAbort = null;
     this.logWriter?.write({
       at: new Date().toISOString(),
@@ -432,192 +325,6 @@ export class PiProcessSession {
 
   private async ensureStarted(): Promise<void> {
     await this.transport.start();
-  }
-
-  private handleEvent(event: Record<string, unknown>): void {
-    switch (event.type) {
-      case "agent_start":
-        this.nativeRunStarted = true;
-        return;
-      case "turn_start":
-        return;
-      case "turn_end":
-      case "agent_end":
-        return;
-      case "agent_settled":
-        this.finishTurn();
-        return;
-      case "message_update":
-        this.emitMessageUpdate(event);
-        return;
-      case "message_end":
-        if (messageRole(event.message) !== "assistant") {
-          return;
-        }
-        if (isToolUseAssistantMessage(event.message)) {
-          return;
-        }
-        {
-          const text = assistantMessageText(event.message);
-          const message = isRecord(event.message) ? event.message : {};
-          this.completion = {
-            ...(text !== null ? { text } : {}),
-            ...(message.stopReason === "error" || message.stopReason === "aborted"
-              ? {
-                  error: String(
-                    message.errorMessage ?? `Pi assistant ${String(message.stopReason)}`
-                  ),
-                }
-              : {}),
-          };
-        }
-        return;
-      case "tool_execution_start":
-        this.emit({
-          sessionId: this.opaqueSessionId,
-          turnId: this.currentTurnId ?? "unknown",
-          type: "tool_start",
-          toolCallId: String(event.toolCallId ?? "unknown"),
-          toolName: String(event.toolName ?? "unknown"),
-          input: event.args,
-        });
-        return;
-      case "tool_execution_update":
-        this.emit({
-          sessionId: this.opaqueSessionId,
-          turnId: this.currentTurnId ?? "unknown",
-          type: "tool_update",
-          toolCallId: String(event.toolCallId ?? "unknown"),
-          toolName: String(event.toolName ?? "unknown"),
-          output: event.partialResult,
-          isCumulative: true,
-        });
-        return;
-      case "tool_execution_end":
-        this.emit({
-          sessionId: this.opaqueSessionId,
-          turnId: this.currentTurnId ?? "unknown",
-          type: "tool_end",
-          toolCallId: String(event.toolCallId ?? "unknown"),
-          toolName: String(event.toolName ?? "unknown"),
-          output: event.result,
-          isError: Boolean(event.isError),
-        });
-        return;
-      case "extension_ui_request":
-        if (
-          event.method === "select" ||
-          event.method === "confirm" ||
-          event.method === "input" ||
-          event.method === "editor"
-        ) {
-          this.emit({
-            sessionId: this.opaqueSessionId,
-            turnId: this.currentTurnId ?? "unknown",
-            type: "elicitation_request",
-            requestId: String(event.id ?? randomUUID()),
-            payload: event,
-          });
-        }
-        return;
-      case "extension_error":
-        this.emit({
-          type: "extension_error",
-          message: String(event.error ?? event.message ?? "Pi extension error"),
-        });
-        return;
-      case "error":
-        this.emit({
-          sessionId: this.opaqueSessionId,
-          turnId: this.currentTurnId ?? "unknown",
-          type: "error",
-          message: String(event.error ?? event.message ?? "Pi runtime error"),
-        });
-        return;
-      default:
-        return;
-    }
-  }
-
-  private emitMessageUpdate(event: Record<string, unknown>): void {
-    const assistantEvent = isRecord(event.assistantMessageEvent)
-      ? event.assistantMessageEvent
-      : undefined;
-    if (!assistantEvent || typeof assistantEvent.type !== "string") {
-      this.logWriter?.write({
-        at: new Date().toISOString(),
-        component: "pi-process",
-        kind: "parsed-event",
-        eventType: "message_update",
-        raw: JSON.stringify(event),
-      });
-      return;
-    }
-
-    if (assistantEvent.type === "text_delta") {
-      const delta = String(assistantEvent.delta ?? "");
-      this.logWriter?.write({
-        at: new Date().toISOString(),
-        component: "pi-process",
-        kind: "parsed-event",
-        eventType: "message_update",
-        assistantEventType: assistantEvent.type,
-        emittedType: "text_delta",
-        delta,
-        raw: JSON.stringify(event),
-      });
-      this.emit({
-        sessionId: this.opaqueSessionId,
-        turnId: this.currentTurnId ?? "unknown",
-        type: "text_delta",
-        delta,
-      });
-      return;
-    }
-
-    if (assistantEvent.type === "thinking_delta") {
-      const delta = String(assistantEvent.delta ?? "");
-      this.logWriter?.write({
-        at: new Date().toISOString(),
-        component: "pi-process",
-        kind: "parsed-event",
-        eventType: "message_update",
-        assistantEventType: assistantEvent.type,
-        emittedType: "thinking_delta",
-        delta,
-        raw: JSON.stringify(event),
-      });
-      this.emit({
-        sessionId: this.opaqueSessionId,
-        turnId: this.currentTurnId ?? "unknown",
-        type: "thinking_delta",
-        delta,
-      });
-      return;
-    }
-
-    if (assistantEvent.type === "error") {
-      this.logWriter?.write({
-        at: new Date().toISOString(),
-        component: "pi-process",
-        kind: "parsed-event",
-        eventType: "message_update",
-        assistantEventType: assistantEvent.type,
-        emittedType: "error",
-        raw: JSON.stringify(event),
-      });
-      this.completion = { error: String(assistantEvent.errorMessage ?? "Pi assistant error") };
-      return;
-    }
-
-    this.logWriter?.write({
-      at: new Date().toISOString(),
-      component: "pi-process",
-      kind: "parsed-event",
-      eventType: "message_update",
-      assistantEventType: assistantEvent.type,
-      raw: JSON.stringify(event),
-    });
   }
 
   private emitTokenUsage(turnId: string): void {
@@ -686,118 +393,9 @@ export class PiProcessSession {
     return await this.transport.request<T>(command);
   }
 
-  private finishTurn(): void {
-    const turnId = this.currentTurnId;
-    if (!turnId) return;
-    this.currentTurnId = null;
-    this.nativeRunStarted = false;
-    this.promptAbort = null;
-    this.emitTokenUsage(turnId);
-    this.emit(
-      this.completion.error
-        ? { sessionId: this.opaqueSessionId, turnId, type: "error", message: this.completion.error }
-        : { sessionId: this.opaqueSessionId, turnId, type: "message_end", ...this.completion }
-    );
-    this.completion = {};
-  }
-
-  private async finishHandledPromptIfIdle(turnId: string): Promise<void> {
-    if (this.nativeRunStarted) return;
-    // "handled" describes this input, not work pi.sendUserMessage started.
-    // Query after the acknowledgement to catch activity that begins asynchronously.
-    // agent_start/settled may arrive while this state request is outstanding.
-    const response = await this.sendRequest<UpstreamSessionState>({ type: "get_state" });
-    const state = response.data;
-    if (
-      this.currentTurnId === turnId &&
-      !this.nativeRunStarted &&
-      !state?.isStreaming &&
-      !state?.isCompacting &&
-      !(state?.pendingMessageCount && state.pendingMessageCount > 0)
-    ) {
-      this.finishTurn();
-    }
-  }
-
   private applySnapshot(snapshot: PiSessionStateSnapshot): void {
     this.currentSessionFile = snapshot.sessionFile;
     this.currentSessionName = snapshot.sessionName;
     this.currentModelContextWindow = snapshot.modelContextWindow;
   }
-
-  private async convertImages(
-    images?: readonly BackendImageInput[],
-    signal?: AbortSignal
-  ): Promise<readonly PiImageContent[] | undefined> {
-    if (!images || images.length === 0) {
-      return undefined;
-    }
-
-    const converted = await Promise.all(
-      images.map(async (image) => {
-        if (typeof image.data === "string" && image.data.length > 0) {
-          return {
-            type: "image" as const,
-            data: image.data,
-            mimeType: image.mimeType ?? "image/png",
-          };
-        }
-
-        if (typeof image.path === "string" && image.path.length > 0) {
-          const buffer = await readFile(image.path, { signal });
-          return {
-            type: "image" as const,
-            data: buffer.toString("base64"),
-            mimeType: image.mimeType ?? "image/png",
-          };
-        }
-
-        if (typeof image.url === "string" && image.url.length > 0) {
-          const response = await fetch(image.url, { ...(signal ? { signal } : {}) });
-          if (!response.ok) {
-            throw new Error(`Failed to fetch image: ${response.status} ${response.statusText}`);
-          }
-          const buffer = Buffer.from(await response.arrayBuffer());
-          return {
-            type: "image" as const,
-            data: buffer.toString("base64"),
-            mimeType: image.mimeType ?? response.headers.get("content-type") ?? "image/png",
-          };
-        }
-
-        throw new Error("Pi backend requires image data, file path, or URL");
-      })
-    );
-
-    return converted;
-  }
-}
-
-function normalizeElicitationResponse(
-  requestId: string,
-  responseValue: unknown
-): Record<string, unknown> {
-  if (typeof responseValue === "string") {
-    return { type: "extension_ui_response", id: requestId, value: responseValue };
-  }
-
-  if (typeof responseValue === "boolean") {
-    return { type: "extension_ui_response", id: requestId, confirmed: responseValue };
-  }
-
-  if (isRecord(responseValue)) {
-    if (responseValue.cancelled === true) {
-      return { type: "extension_ui_response", id: requestId, cancelled: true as const };
-    }
-
-    if (typeof responseValue.value === "string") {
-      return { type: "extension_ui_response", id: requestId, value: responseValue.value };
-    }
-
-    if (typeof responseValue.confirmed === "boolean") {
-      return { type: "extension_ui_response", id: requestId, confirmed: responseValue.confirmed };
-    }
-  }
-
-  throw new Error("Unsupported Pi elicitation response shape");
 }
