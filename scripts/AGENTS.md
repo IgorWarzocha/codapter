@@ -1,4 +1,4 @@
-- Ship `dist/codapter.mjs` and `dist/collab-extension.mjs` together. Resolve extension assets from the built bundle, not the checkout or caller's cwd.
+- Ship every sibling asset produced by `build-dist.mjs`, retaining executable permissions on the CLI and desktop MCP proxy.
 - Desktop launchers must not silently enable collaboration, expose CDP, change Pi configuration, or clear thread state. Pass explicit desktop flags through unchanged and quit your test instance before switching backends.
 - Traffic logs contain prompts, files, tool output, and possibly credentials. Keep them private and out of Git.
 - Release versions have one code owner, `packages/core/src/version.ts`, updated with the root manifests by `release.mjs`. Never add an independent CLI or handshake version constant.

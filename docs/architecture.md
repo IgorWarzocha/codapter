@@ -22,6 +22,10 @@ Within those packages, ownership follows the runtime boundary:
 | Core `thread-history.ts` | Stable turn/item pagination and summary projection over backend-owned history |
 | Core `thread-catalog.ts`, `backend-thread-mirror.ts` | Registry queries and mutations, native child-thread identity translation |
 | Core `backend-server-requests.ts` | Backend request IDs and GUI answer correlation |
+| Core `desktop-plugins.ts`, `desktop-plugin-files.ts`, `desktop-plugin-mcp.ts` | Local plugin inventory, enabled skills, and desktop-to-Pi MCP configuration policy |
+| Core `desktop-browser-policy.ts` | Effective Browser policy snapshots and rejection of unsupported native config layers |
+| Core `thread-desktop.ts`, `thread-mcp.ts` | Thread capability snapshots, dynamic tool validation, and rich MCP item lifecycle |
+| Core `config-toml.ts`, `config-store.ts` | TOML boundaries and transactional adapter setting writes |
 | Core `collab-manager.ts`, `collab-agent-session.ts`, `collab-wait-queue.ts` | Child-agent orchestration, subscribed child lifetime, and pending waits |
 | Core `account-session.ts`, `native-session.ts` | Account state and native Codex transcript parsing |
 | Core `thread-protocol.ts` | Thread serialization and input previews |
@@ -32,6 +36,10 @@ Within those packages, ownership follows the runtime boundary:
 | Pi `session-runtime.ts`, `model-discovery.ts` | Process activation, probes, idle disposal, persistence, and cached discovery |
 | Pi `thread-controller.ts` | Thread reservations, serialized app-server events, and dialog pairing |
 | Pi `extension-ui.ts` | Pi dialogs and Codex user-input response translation |
+| Pi `desktop-bridge.ts`, `desktop-extension/` | Private session transport, native capability registration, GUI tool calls and permission requests |
+| Pi `desktop-mcp-proxy.ts`, `chatgpt-apps-relay.ts` | Native browser metadata and cleanup, fixed-target authenticated apps transport, and tool-policy enforcement |
+| Pi `desktop-auth.ts`, `desktop-host-services.ts`, `desktop-browser-policy.ts` | On-demand native Pi authentication, narrow browser host RPCs, and managed-policy support checks |
+| Pi `mcp-event-filter.ts` | Suppression of duplicate direct Pi tool items only after observing the corresponding raw MCP call |
 | Pi `session-history.ts` | Pi session history normalization |
 | Pi `index.ts` | Public backend composition and thread operations |
 | Codex `rpc-transport.ts`, `index.ts` | Native child and pending RPC lifetime, backend thread routing |
@@ -93,6 +101,8 @@ Thread metadata is adapter-owned and persisted by `packages/core/src/thread-regi
 - Implements backend-owned `thread/read` hydration for Pi threads.
 - Applies reasoning through `set_thinking_level`. Turn completion waits for `agent_settled`, not the end of an individual assistant message or low-level agent run.
 - Routes native extension dialogs through `item/tool/requestUserInput`. Custom terminal UI has no Pi RPC representation.
+- Registers desktop capabilities through supported Pi extension APIs. Native Pi MCP definitions win name conflicts. Desktop MCP configs and credentials are not persisted in thread metadata.
+- Keeps raw MCP arguments, results, and widget metadata opaque when translating GUI thread IDs. Rich MCP items are retained by the current runtime, not a second transcript store.
 
 ### Codex Backend (`packages/backend-codex`)
 
@@ -111,6 +121,6 @@ With collaboration enabled, `CollabManager` routes child-agent operations (`spaw
 - Codex WebSocket transport is unsupported.
 - Pi-backed threads can spawn Codex sub-agents, but Codex-backed threads cannot spawn Pi sub-agents.
 - `command/exec` PTY mode is not implemented (`tty: true` rejected).
-- MCP server elicitation remains unsupported.
-- GUI-provided dynamic tool definitions and calls are not bridged into Pi. A desktop plugin's agent-facing tools are not available merely because the GUI has enabled that plugin.
+- Remote plugin installation and native desktop management RPCs are not a complete plugin manager.
+- Cold Pi history does not retain every live MCP widget metadata field. Native Pi remains the history owner.
 - Desktop sandbox labels do not sandbox native Pi tools. Pi retains its installed permissions and extension behavior.

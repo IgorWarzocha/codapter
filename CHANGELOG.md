@@ -12,6 +12,8 @@
 - Added opt-in installed-Pi smoke coverage using Luna 6 with low reasoning, separate from deterministic integration fixtures.
 - Added isolated adapter storage through `CODAPTER_STATE_DIR` and `CODAPTER_CONFIG_FILE`.
 - Added Linux ChatGPT Desktop launching and a portable bundled collaboration extension.
+- Bridged enabled local desktop plugin skills, MCP servers, and GUI-provided tool calls into native Pi sessions, with scoped permissions and cancellation.
+- Added direct ChatGPT apps support using Pi's existing sign-in and native Browser host integration with live thread metadata and GUI permission requests.
 
 ### Changed
 
@@ -34,6 +36,7 @@
 - Released subscriptions after failed thread setup and prevented stale queued events from reactivating archived or resumed threads.
 - Serialized thread-registry snapshots and initial loading to prevent concurrent write collisions and stale disk state.
 - Implemented paginated turn and item history required by current ChatGPT Desktop when reopening a conversation, and restored the required text metadata missing from Pi history.
+- Preserved quoted plugin keys and nested MCP settings with proper TOML parsing and transactional config writes.
 
 ### Removed
 

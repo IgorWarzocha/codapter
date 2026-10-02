@@ -1,7 +1,12 @@
 import { randomUUID } from "node:crypto";
 import { homedir } from "node:os";
 import { join } from "node:path";
-import type { BackendImageInput, BackendMessage, BackendSessionLaunchConfig } from "@codapter/core";
+import type {
+  BackendImageInput,
+  BackendMessage,
+  BackendSessionLaunchConfig,
+  DesktopSessionCapabilities,
+} from "@codapter/core";
 import { PiModelDiscovery } from "./model-discovery.js";
 import {
   type PiProcessLaunchOptions,
@@ -19,6 +24,8 @@ export interface PiBackendOptions {
   readonly debugLogFilePath?: string | null;
   readonly idleTimeoutMs?: number;
   readonly collabExtensionPath?: string | null;
+  readonly desktopExtensionPath?: string | null;
+  readonly desktopMcpProxyPath?: string | null;
   readonly staticAvailableModelsPath?: string | null;
   readonly requestTimeoutMs?: number;
 }
@@ -84,6 +91,8 @@ export class PiSessionRuntime {
   private initialized = false;
   private disposed = false;
   private readonly collabExtensionPath: string | null;
+  private readonly desktopExtensionPath: string | null;
+  private readonly desktopMcpProxyPath: string | null;
 
   constructor(
     options: PiBackendOptions,
@@ -121,6 +130,8 @@ export class PiSessionRuntime {
     this.launchOptions = launchOptions;
     this.idleTimeoutMs = options.idleTimeoutMs ?? 300_000;
     this.collabExtensionPath = options.collabExtensionPath ?? null;
+    this.desktopExtensionPath = options.desktopExtensionPath ?? null;
+    this.desktopMcpProxyPath = options.desktopMcpProxyPath ?? null;
     this.stateStore = new PiBackendStateStore(this.sessionDir);
     this.models = new PiModelDiscovery(
       options.staticAvailableModelsPath ?? null,
@@ -171,17 +182,18 @@ export class PiSessionRuntime {
   async createSession(config?: BackendSessionLaunchConfig): Promise<string> {
     this.assertReady();
     const sessionId = opaqueSessionId();
-    const process = this.createProcess(sessionId, config);
+    if (config) this.launchConfigs.set(sessionId, config);
+    const process = this.createProcess(sessionId, config, true);
     try {
       const snapshot = await process.startFresh();
       this.assertReady();
       const record = await this.persistSnapshot(sessionId, snapshot);
       this.assertReady();
       this.sessions.set(sessionId, { process, record });
-      if (config) this.launchConfigs.set(sessionId, config);
       this.resetIdleTimer(sessionId);
       return sessionId;
     } catch (error) {
+      this.launchConfigs.delete(sessionId);
       await this.disposeProcess(process);
       throw error;
     }
@@ -190,9 +202,24 @@ export class PiSessionRuntime {
   async resumeSession(sessionId: string, config?: BackendSessionLaunchConfig): Promise<string> {
     this.assertReady();
     if (config) {
-      this.launchConfigs.set(sessionId, config);
+      const previous = this.launchConfigs.get(sessionId);
+      const record = await this.requireRecord(sessionId);
+      const desktopCapabilities =
+        config.desktopCapabilities ??
+        previous?.desktopCapabilities ??
+        (record.desktopCapabilities
+          ? { ...record.desktopCapabilities, mcpServers: {} }
+          : undefined);
+      this.launchConfigs.set(sessionId, {
+        ...previous,
+        ...config,
+        ...(desktopCapabilities ? { desktopCapabilities } : {}),
+      });
     }
     await this.ensureActiveSession(sessionId);
+    if (config?.desktopCapabilities) {
+      await this.refreshDesktopCapabilities(sessionId, config.desktopCapabilities);
+    }
     this.resetIdleTimer(sessionId);
     return sessionId;
   }
@@ -205,7 +232,17 @@ export class PiSessionRuntime {
     }
 
     const forkedSessionId = opaqueSessionId();
-    const process = this.createProcess(forkedSessionId, config);
+    const forkConfig = {
+      ...config,
+      desktopCapabilities: config?.desktopCapabilities ??
+        this.launchConfigs.get(sessionId)?.desktopCapabilities ?? {
+          tools: source.record.desktopCapabilities?.tools ?? [],
+          instructions: source.record.desktopCapabilities?.instructions ?? [],
+          mcpServers: {},
+        },
+    };
+    this.launchConfigs.set(forkedSessionId, forkConfig);
+    const process = this.createProcess(forkedSessionId, forkConfig, true);
     try {
       await process.attachSession(source.record.sessionFile);
       // clone keeps the whole active branch. fork rewinds to BEFORE a user message.
@@ -215,10 +252,10 @@ export class PiSessionRuntime {
       const record = await this.persistSnapshot(forkedSessionId, snapshot, source.record.createdAt);
       this.assertReady();
       this.sessions.set(forkedSessionId, { process, record });
-      if (config) this.launchConfigs.set(forkedSessionId, config);
       this.resetIdleTimer(forkedSessionId);
       return forkedSessionId;
     } catch (error) {
+      this.launchConfigs.delete(forkedSessionId);
       await this.disposeProcess(process);
       throw error;
     }
@@ -286,11 +323,12 @@ export class PiSessionRuntime {
     sessionId: string,
     turnId: string,
     text: string,
-    images?: readonly BackendImageInput[]
+    images?: readonly BackendImageInput[],
+    capabilities?: DesktopSessionCapabilities
   ): Promise<void> {
     this.assertReady();
     const session = await this.ensureActiveSession(sessionId);
-
+    if (capabilities) await this.refreshDesktopCapabilities(sessionId, capabilities);
     await session.process.prompt(turnId, text, images);
     this.resetIdleTimer(sessionId);
     session.record = await this.updateRecord(sessionId, {
@@ -393,7 +431,8 @@ export class PiSessionRuntime {
 
   private createProcess(
     sessionId: string,
-    launchConfig?: BackendSessionLaunchConfig
+    launchConfig?: BackendSessionLaunchConfig,
+    desktopSession = false
   ): PiProcessSession {
     const effectiveLaunchConfig = launchConfig ?? this.launchConfigs.get(sessionId);
     const options: PiProcessLaunchOptions = {
@@ -403,6 +442,12 @@ export class PiSessionRuntime {
       ...(effectiveLaunchConfig?.cwd ? { cwd: effectiveLaunchConfig.cwd } : {}),
       ...(this.collabExtensionPath !== null
         ? { collabExtensionPath: this.collabExtensionPath }
+        : {}),
+      ...(desktopSession && this.desktopExtensionPath !== null
+        ? { desktopExtensionPath: this.desktopExtensionPath }
+        : {}),
+      ...(desktopSession && this.desktopMcpProxyPath !== null
+        ? { desktopMcpProxyPath: this.desktopMcpProxyPath }
         : {}),
       ...(effectiveLaunchConfig ? { launchConfig: effectiveLaunchConfig } : {}),
     };
@@ -447,7 +492,15 @@ export class PiSessionRuntime {
       this.sessions.delete(sessionId);
     }
     const record = await this.requireRecord(sessionId);
-    const process = this.createProcess(sessionId);
+    if (!this.launchConfigs.has(sessionId) && record.desktopCapabilities) {
+      this.launchConfigs.set(sessionId, {
+        desktopCapabilities: {
+          ...record.desktopCapabilities,
+          mcpServers: {},
+        },
+      });
+    }
+    const process = this.createProcess(sessionId, undefined, true);
     try {
       const snapshot = await process.attachSession(record.sessionFile);
       this.assertReady();
@@ -479,6 +532,7 @@ export class PiSessionRuntime {
     if (!snapshot.sessionFile) {
       throw new Error("Pi session snapshot did not include a session file");
     }
+    const capabilities = this.launchConfigs.get(sessionId)?.desktopCapabilities;
     const record: PiBackendSessionRecord = {
       opaqueSessionId: sessionId,
       sessionFile: snapshot.sessionFile,
@@ -486,6 +540,14 @@ export class PiSessionRuntime {
       modelId: snapshot.modelId ?? null,
       createdAt: createdAt ?? nowIso(),
       updatedAt: nowIso(),
+      ...(capabilities
+        ? {
+            desktopCapabilities: {
+              tools: structuredClone(capabilities.tools),
+              instructions: [...capabilities.instructions],
+            },
+          }
+        : {}),
     };
     await this.stateStore.upsert(record);
     return record;
@@ -496,5 +558,24 @@ export class PiSessionRuntime {
     patch: Partial<Omit<PiBackendSessionRecord, "opaqueSessionId" | "createdAt">>
   ): Promise<PiBackendSessionRecord> {
     return await this.stateStore.update(sessionId, patch);
+  }
+
+  private async refreshDesktopCapabilities(
+    sessionId: string,
+    capabilities: DesktopSessionCapabilities
+  ): Promise<void> {
+    this.launchConfigs.set(sessionId, {
+      ...this.launchConfigs.get(sessionId),
+      desktopCapabilities: structuredClone(capabilities),
+    });
+    this.sessions.get(sessionId)?.process.refreshDesktopCapabilities(capabilities);
+    const record = await this.updateRecord(sessionId, {
+      desktopCapabilities: {
+        tools: structuredClone(capabilities.tools),
+        instructions: [...capabilities.instructions],
+      },
+    });
+    const session = this.sessions.get(sessionId);
+    if (session) session.record = record;
   }
 }

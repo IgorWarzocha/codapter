@@ -6,7 +6,7 @@ This document covers how to run codapter locally, how the main transport options
 
 - Node.js 24 LTS recommended. Supported alternatives are Node 22.22.1+ and 26+.
 - `npm` workspaces enabled.
-- The repo checked out with the `packages/*` workspace layout intact for development. Deployment needs both `dist/codapter.mjs` and `dist/collab-extension.mjs`.
+- The repo checked out with the `packages/*` workspace layout intact for development. Deployment needs all four `.mjs` files produced in `dist/`, retaining executable permissions on the CLI and desktop MCP proxy.
 - An installed `pi` command with configured authentication and extensions.
 
 ## Build And Test
@@ -40,7 +40,7 @@ Without `--listen`, codapter serves the app-server protocol over stdio.
 - `--analytics-default-enabled` is accepted and ignored.
 - `--version` prints the package version.
 - `--help` prints usage.
-- Native `-c key=value`, `--config key=value`, and `--config=key=value` overrides are accepted before or after `app-server` for Desktop compatibility. They are forwarded intact to Codex. For Pi, Codapter logs the ignored keys without their values. Pi's native extensions and settings remain authoritative.
+- Native `-c key=value`, `--config key=value`, and `--config=key=value` overrides are accepted before or after `app-server` for Desktop compatibility, including quoted plugin keys. They are forwarded intact to Codex. Desktop capability settings feed Pi's session-local bridge. Other native settings are ignored for Pi, with only their keys logged. Pi's own model defaults, extensions, and authentication remain authoritative.
 
 ## Desktop Integration
 
@@ -107,7 +107,7 @@ Codapter routes thread and turn operations through `BackendRouter` into register
 
 ## Current Limitations
 
-- Pi-backed elicitation is supported through `item/tool/requestUserInput`. MCP server elicitation is still unsupported.
+- Pi dialogs use `item/tool/requestUserInput`. Bridged desktop MCP elicitations use `mcpServer/elicitation/request` and retain the GUI's actual decision.
 - Remote tunnel orchestration is not automated by codapter. Use your own SSH or port-forward setup if you want to connect to a WebSocket listener remotely.
 - Native Codex backend WebSocket transport is unsupported. Client-facing WebSocket listeners are independent and supported.
 - Pi-backed threads can spawn Codex sub-agents, but Codex-backed threads cannot spawn Pi sub-agents.

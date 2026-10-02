@@ -11,6 +11,11 @@ import {
   type CollabManagerNotificationSink,
 } from "./collab-manager.js";
 import { CollabUdsListener } from "./collab-uds.js";
+import {
+  hasCompleteBrowserOverrides,
+  resumeBrowserConfig,
+  threadBrowserOverrides,
+} from "./desktop-browser-policy.js";
 import type {
   Thread,
   ThreadArchiveParams,
@@ -31,10 +36,16 @@ import type {
 } from "./protocol.js";
 import { ThreadCatalog } from "./thread-catalog.js";
 import {
+  normalizeDynamicTools,
+  ThreadDesktop,
+  type ThreadDesktopPlugins,
+} from "./thread-desktop.js";
+import {
   buildSandboxPolicy,
   DEFAULT_APPROVAL_POLICY,
   DEFAULT_APPROVALS_REVIEWER,
   rewriteCollaborationModeSettings,
+  type ThreadExecutionContext,
   type ThreadExecutionSettings,
 } from "./thread-execution.js";
 import { ThreadHistory } from "./thread-history.js";
@@ -53,6 +64,7 @@ export interface ThreadSessionsOptions {
   backendRouter: BackendRouter;
   threadRegistry: ThreadRegistry;
   execution: ThreadExecutionSettings;
+  desktopPlugins?: ThreadDesktopPlugins;
   serverRequests: BackendServerRequests;
   collabEnabled: boolean;
   logger: AppServerLogger;
@@ -66,6 +78,7 @@ export class ThreadSessions {
   private readonly backendRouter: BackendRouter;
   private readonly threadRegistry: ThreadRegistry;
   private readonly execution: ThreadExecutionSettings;
+  private readonly desktop: ThreadDesktop;
   private readonly serverRequests: BackendServerRequests;
   private readonly mirror: BackendThreadMirror;
   private readonly collabEnabled: boolean;
@@ -81,6 +94,7 @@ export class ThreadSessions {
     this.backendRouter = options.backendRouter;
     this.threadRegistry = options.threadRegistry;
     this.execution = options.execution;
+    this.desktop = new ThreadDesktop(this.execution, options.desktopPlugins);
     this.serverRequests = options.serverRequests;
     this.collabEnabled = options.collabEnabled;
     this.logger = options.logger;
@@ -146,7 +160,11 @@ export class ThreadSessions {
           }
           return runtime.backendType;
         },
-        createSessionLaunchConfig: (threadId) => this.createBackendSessionLaunchConfig(threadId),
+        createSessionLaunchConfig: (
+          threadId: string,
+          context?: ThreadExecutionContext | null,
+          backendType?: string
+        ) => this.createBackendSessionLaunchConfig(threadId, context ?? undefined, backendType),
         resolveThreadExecutionContext: (threadId) =>
           this.execution.cloneThreadExecutionContext(threadId),
         createChildThread: async (input) => {
@@ -186,7 +204,8 @@ export class ThreadSessions {
       this.threadRegistry,
       this.execution,
       this.collabManager,
-      (threadId) => this.threadRuntimes.get(threadId)
+      (threadId) => this.threadRuntimes.get(threadId),
+      this.desktop
     );
   }
 
@@ -203,6 +222,7 @@ export class ThreadSessions {
 
   async start(params: unknown): Promise<ThreadStartResponse> {
     const parsed = params as ThreadStartParams;
+    const dynamicTools = normalizeDynamicTools(parsed.dynamicTools);
     await this.collabReady;
     const threadId = randomUUID();
     const ephemeral = parsed.ephemeral ?? false;
@@ -223,6 +243,8 @@ export class ThreadSessions {
       ephemeral
     );
     const backend = selection.backend;
+    const browserOverrides =
+      backend.backendType === "pi" ? threadBrowserOverrides(parsed.config ?? {}) : undefined;
     const threadStart = await backend.threadStart({
       threadId,
       cwd: parsed.cwd ?? process.cwd(),
@@ -240,7 +262,16 @@ export class ThreadSessions {
       ephemeral: parsed.ephemeral ?? null,
       experimentalRawEvents: parsed.experimentalRawEvents,
       persistExtendedHistory: parsed.persistExtendedHistory,
-      launchConfig: await this.createBackendSessionLaunchConfig(threadId),
+      ...(parsed.dynamicTools != null ? { dynamicTools } : {}),
+      launchConfig: await this.createBackendSessionLaunchConfig(
+        threadId,
+        {
+          cwd: parsed.cwd ?? process.cwd(),
+          config: parsed.config ?? null,
+          dynamicTools,
+        },
+        backend.backendType
+      ),
     });
     const selectedModel = this.backendRouter.toClientModelId(
       selection.selection.backendType,
@@ -260,6 +291,8 @@ export class ThreadSessions {
       modelProvider: parsed.modelProvider ?? backend.backendType,
       reasoningEffort: threadStart.reasoningEffort ?? effectiveReasoningEffort,
       gitInfo: null,
+      dynamicTools,
+      browserOverrides,
     });
 
     const runtime = this.createRuntime(
@@ -290,6 +323,8 @@ export class ThreadSessions {
       personality: parsed.personality ?? null,
       summary: null,
       collaborationMode: null,
+      dynamicTools,
+      browserOverridesKnown: true,
     });
     await this.publish("thread/started", { thread }, entry.threadId);
     await this.publishThreadStatus(entry.threadId);
@@ -302,7 +337,8 @@ export class ThreadSessions {
       parsed.approvalPolicy ?? null,
       parsed.approvalsReviewer ?? null,
       parsed.sandbox ?? null,
-      threadStart.reasoningEffort ?? effectiveReasoningEffort
+      threadStart.reasoningEffort ?? effectiveReasoningEffort,
+      entry.disabledPluginIds
     );
   }
 
@@ -310,6 +346,19 @@ export class ThreadSessions {
     const parsed = params as ThreadResumeParams;
     let entry = await this.getThreadEntry(parsed.threadId);
     const backend = this.requireBackend(entry.backendType);
+    const existingContext = this.execution.cloneThreadExecutionContext(parsed.threadId);
+    const browserOverridesKnown =
+      entry.browserOverrides != null || hasCompleteBrowserOverrides(parsed.config);
+    const resumeConfig =
+      entry.backendType === "pi"
+        ? resumeBrowserConfig(existingContext?.config ?? entry.browserOverrides, parsed.config)
+        : (parsed.config ?? null);
+    const browserOverrides =
+      entry.backendType === "pi"
+        ? browserOverridesKnown
+          ? threadBrowserOverrides(resumeConfig ?? {})
+          : null
+        : undefined;
     const effectiveModel = this.execution.resolveRequestedModel(
       parsed.cwd ?? entry.cwd,
       parsed.model,
@@ -365,7 +414,16 @@ export class ThreadSessions {
         developerInstructions: parsed.developerInstructions ?? null,
         personality: parsed.personality ?? null,
         persistExtendedHistory: parsed.persistExtendedHistory,
-        launchConfig: await this.createBackendSessionLaunchConfig(parsed.threadId),
+        launchConfig: await this.createBackendSessionLaunchConfig(
+          parsed.threadId,
+          {
+            cwd: parsed.cwd ?? entry.cwd ?? process.cwd(),
+            config: resumeConfig,
+            dynamicTools: entry.dynamicTools ?? [],
+            browserOverridesKnown,
+          },
+          entry.backendType
+        ),
       });
       runtime.updateHandle(entry.backendType, resumed.threadHandle);
       runtime.bindSubscription(
@@ -382,13 +440,15 @@ export class ThreadSessions {
         entry.backendSessionId !== resumed.threadHandle ||
         entry.path !== resumed.path ||
         entry.model !== effectiveModel ||
-        entry.reasoningEffort !== effectiveReasoningEffort
+        entry.reasoningEffort !== effectiveReasoningEffort ||
+        entry.backendType === "pi"
       ) {
         entry = await this.threadRegistry.update(parsed.threadId, {
           backendSessionId: resumed.threadHandle,
           path: entry.ephemeral ? null : resumed.path,
           model: effectiveModel,
           reasoningEffort: effectiveReasoningEffort,
+          browserOverrides,
         });
       }
 
@@ -430,7 +490,8 @@ export class ThreadSessions {
         approvalsReviewer: parsed.approvalsReviewer ?? DEFAULT_APPROVALS_REVIEWER,
         sandbox: parsed.sandbox ?? null,
         sandboxPolicy: buildSandboxPolicy(parsed.sandbox ?? null, parsed.cwd ?? thread.cwd),
-        config: parsed.config ?? null,
+        config: resumeConfig,
+        browserOverridesKnown,
         reasoningEffort: entry.reasoningEffort,
         serviceTier: parsed.serviceTier ?? null,
         serviceName: null,
@@ -439,6 +500,7 @@ export class ThreadSessions {
         personality: parsed.personality ?? null,
         summary: null,
         collaborationMode: null,
+        dynamicTools: entry.dynamicTools ?? [],
       });
       await this.publishThreadStatus(parsed.threadId);
       const response = await this.execution.buildThreadExecutionResponse(
@@ -450,7 +512,8 @@ export class ThreadSessions {
         parsed.approvalPolicy ?? null,
         parsed.approvalsReviewer ?? null,
         parsed.sandbox ?? null,
-        effectiveReasoningEffort
+        effectiveReasoningEffort,
+        entry.disabledPluginIds
       );
       return {
         ...response,
@@ -468,7 +531,20 @@ export class ThreadSessions {
   async fork(params: unknown): Promise<ThreadForkResponse> {
     const parsed = params as ThreadForkParams;
     const sourceEntry = await this.getThreadEntry(parsed.threadId);
+    const sourceContext = this.execution.cloneThreadExecutionContext(parsed.threadId);
     const backend = this.requireBackend(sourceEntry.backendType);
+    const forkConfig =
+      sourceEntry.backendType === "pi"
+        ? resumeBrowserConfig(sourceContext?.config ?? sourceEntry.browserOverrides, parsed.config)
+        : (parsed.config ?? null);
+    const browserOverridesKnown =
+      sourceEntry.browserOverrides != null || hasCompleteBrowserOverrides(parsed.config);
+    const browserOverrides =
+      sourceEntry.backendType === "pi"
+        ? browserOverridesKnown
+          ? threadBrowserOverrides(forkConfig ?? {})
+          : null
+        : undefined;
     const sourceRuntime = this.threadRuntimes.get(parsed.threadId);
     if (sourceRuntime && sourceRuntime.status !== "ready") {
       throw new Error(`Cannot fork thread ${parsed.threadId} (status: ${sourceRuntime.status})`);
@@ -521,7 +597,17 @@ export class ThreadSessions {
         developerInstructions: parsed.developerInstructions ?? null,
         ephemeral: parsed.ephemeral ?? null,
         persistExtendedHistory: parsed.persistExtendedHistory,
-        launchConfig: await this.createBackendSessionLaunchConfig(forkThreadId),
+        launchConfig: await this.createBackendSessionLaunchConfig(
+          forkThreadId,
+          {
+            cwd: parsed.cwd ?? sourceEntry.cwd ?? process.cwd(),
+            config: forkConfig,
+            dynamicTools: sourceEntry.dynamicTools ?? [],
+            disabledPluginIds: sourceEntry.disabledPluginIds ?? [],
+            browserOverridesKnown,
+          },
+          sourceEntry.backendType
+        ),
       });
       const ephemeral = parsed.ephemeral ?? false;
       let entry = await this.threadRegistry.create({
@@ -540,6 +626,9 @@ export class ThreadSessions {
         reasoningEffort: forked.reasoningEffort ?? effectiveReasoningEffort,
         name: sourceEntry.name,
         gitInfo: sourceEntry.gitInfo,
+        dynamicTools: sourceEntry.dynamicTools ?? [],
+        disabledPluginIds: sourceEntry.disabledPluginIds ?? [],
+        browserOverrides,
       });
 
       const forkRuntime = this.createRuntime(
@@ -574,7 +663,8 @@ export class ThreadSessions {
           parsed.sandbox ?? null,
           parsed.cwd ?? sourceEntry.cwd ?? process.cwd()
         ),
-        config: parsed.config ?? null,
+        config: forkConfig,
+        browserOverridesKnown,
         reasoningEffort: entry.reasoningEffort,
         serviceTier: parsed.serviceTier ?? null,
         serviceName: null,
@@ -583,6 +673,7 @@ export class ThreadSessions {
         personality: null,
         summary: null,
         collaborationMode: null,
+        dynamicTools: entry.dynamicTools ?? [],
       });
       await this.publish("thread/started", { thread }, entry.threadId);
       await this.publishThreadStatus(entry.threadId);
@@ -595,7 +686,8 @@ export class ThreadSessions {
         parsed.approvalPolicy ?? null,
         parsed.approvalsReviewer ?? null,
         parsed.sandbox ?? null,
-        forked.reasoningEffort ?? effectiveReasoningEffort
+        forked.reasoningEffort ?? effectiveReasoningEffort,
+        entry.disabledPluginIds
       );
     } catch (error) {
       if (forkThreadId) {
@@ -720,10 +812,9 @@ export class ThreadSessions {
   }
 
   private buildThread(entry: ThreadRegistryEntry, turns: Turn[]): Thread {
-    return serializeThread(
-      entry,
-      this.threadRuntimes.get(entry.threadId)?.threadStatus ?? { type: "notLoaded" },
-      turns
+    return (
+      this.threadRuntimes.get(entry.threadId)?.buildThread(entry, turns) ??
+      serializeThread(entry, { type: "notLoaded" }, turns)
     );
   }
 
@@ -747,16 +838,33 @@ export class ThreadSessions {
   }
 
   private async createBackendSessionLaunchConfig(
-    threadId: string
+    threadId: string,
+    context?: Pick<ThreadExecutionContext, "cwd" | "config" | "dynamicTools"> &
+      Pick<ThreadExecutionContext, "browserOverridesKnown"> &
+      Pick<ThreadRegistryEntry, "disabledPluginIds">,
+    backendType?: string
   ): Promise<BackendSessionLaunchConfig> {
+    const entry = await this.threadRegistry.get(threadId);
+    const snapshot = context ?? this.execution.cloneThreadExecutionContext(threadId);
+    const desktopCapabilities =
+      (backendType ?? entry?.backendType) === "pi"
+        ? await this.desktop.capabilities(
+            snapshot?.cwd ?? entry?.cwd ?? process.cwd(),
+            snapshot?.config ?? resumeBrowserConfig(entry?.browserOverrides, null),
+            snapshot?.dynamicTools ?? entry?.dynamicTools ?? [],
+            context?.disabledPluginIds ?? entry?.disabledPluginIds ?? [],
+            snapshot?.browserOverridesKnown ?? (entry ? entry.browserOverrides != null : true)
+          )
+        : undefined;
     if (!this.collabEnabled || !this.collabUdsListener) {
-      return {};
+      return desktopCapabilities ? { desktopCapabilities } : {};
     }
 
     return {
       threadId,
       collabSocketPath: this.collabUdsListener.socketPath,
       availableModelsDescription: await this.createCollabAvailableModelsDescription(),
+      ...(desktopCapabilities ? { desktopCapabilities } : {}),
     };
   }
 
@@ -820,6 +928,14 @@ export class ThreadSessions {
       agentNickname: input.nickname,
       agentRole: input.role,
       gitInfo: null,
+      dynamicTools: parentContext?.dynamicTools ?? parentEntry.dynamicTools ?? [],
+      disabledPluginIds: parentEntry.disabledPluginIds ?? [],
+      browserOverrides:
+        input.backendType === "pi"
+          ? parentEntry.browserOverrides == null
+            ? null
+            : threadBrowserOverrides(parentContext?.config ?? parentEntry.browserOverrides)
+          : undefined,
     });
     const runtime = this.createRuntime(entry.threadId, input.backendType, input.threadHandle, true);
     runtime.ready();

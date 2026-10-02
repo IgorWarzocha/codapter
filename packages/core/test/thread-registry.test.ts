@@ -19,6 +19,155 @@ async function createRegistry() {
 }
 
 describe("ThreadRegistry", () => {
+  it("sanitizes thread Browser overrides across create, update, and disk reload without masking unknown legacy state", async () => {
+    const registry = await createRegistry();
+    expect(
+      (await registry.create({ backendSessionId: "unknown", backendType: "pi" })).browserOverrides
+    ).toBeNull();
+    expect(
+      (
+        await registry.create({
+          backendSessionId: "known",
+          backendType: "pi",
+          browserOverrides: {},
+        })
+      ).browserOverrides
+    ).toEqual({});
+    const base = await registry.create({
+      backendSessionId: "session",
+      backendType: "pi",
+      browserOverrides: {
+        "browser_use.default_origin_policy.access": "deny",
+        "browser_use.allow_history_access": false,
+        profile: "selected",
+        profiles: {
+          selected: {
+            model: "DO_NOT_PERSIST",
+            mcp_servers: { secret: { env: { TOKEN: "DO_NOT_PERSIST" } } },
+          },
+        },
+        mcp_servers: { secret: { env: { TOKEN: "DO_NOT_PERSIST" } } },
+      },
+    });
+    expect(base.browserOverrides).toEqual({
+      browser_use: { default_origin_policy: { access: "deny" }, allow_history_access: false },
+      profile: "selected",
+      profiles: { selected: {} },
+    });
+    expect(await readFile(registry.path, "utf8")).not.toContain("DO_NOT_PERSIST");
+    const disk = new ThreadRegistry(registry.path);
+    expect((await disk.get(base.threadId))?.browserOverrides).toEqual(base.browserOverrides);
+    await disk.update(base.threadId, {
+      browserOverrides: { browser_use: { allow_history_access: true }, model: "DO_NOT_PERSIST" },
+    });
+    expect((await new ThreadRegistry(registry.path).get(base.threadId))?.browserOverrides).toEqual({
+      browser_use: { allow_history_access: true },
+    });
+    expect(await readFile(registry.path, "utf8")).not.toContain("DO_NOT_PERSIST");
+    await writeFile(
+      registry.path,
+      JSON.stringify({
+        threads: [
+          { ...base, threadId: "legacy", browserOverrides: undefined },
+          {
+            ...base,
+            threadId: "corrupt",
+            browserOverrides: {
+              browser_use: { default_origin_policy: { access: "DO_NOT_EXPOSE" } },
+            },
+          },
+        ],
+      })
+    );
+    const warn = vi.fn();
+    const restored = new ThreadRegistry(registry.path, { warn });
+    expect((await restored.get("legacy"))?.browserOverrides).toBeNull();
+    expect(await restored.get("corrupt")).toBeNull();
+    expect(JSON.stringify(warn.mock.calls)).not.toContain("DO_NOT_EXPOSE");
+    await restored.update("legacy", { name: "renamed" });
+    expect((await new ThreadRegistry(registry.path).get("legacy"))?.browserOverrides).toBeNull();
+  });
+
+  it("restores disabled plugin lists, migrates missing lists, and isolates corrupt metadata", async () => {
+    const registry = await createRegistry();
+    const ids = ["browser@openai-bundled"];
+    const base = await registry.create({
+      backendSessionId: "session",
+      backendType: "pi",
+      disabledPluginIds: ids,
+    });
+    ids.push("not-in-store");
+    expect(base.disabledPluginIds).toEqual(["browser@openai-bundled"]);
+    await writeFile(
+      registry.path,
+      JSON.stringify({
+        threads: [
+          { ...base, threadId: "disabled" },
+          { ...base, threadId: "legacy", disabledPluginIds: undefined },
+          { ...base, threadId: "corrupt", disabledPluginIds: [123] },
+        ],
+      })
+    );
+    const warn = vi.fn();
+    const restored = new ThreadRegistry(registry.path, { warn });
+    expect((await restored.get("disabled"))?.disabledPluginIds).toEqual(["browser@openai-bundled"]);
+    expect((await restored.get("legacy"))?.disabledPluginIds).toEqual([]);
+    expect(await restored.get("corrupt")).toBeNull();
+    expect(warn).toHaveBeenCalledOnce();
+    await restored.update("disabled", { disabledPluginIds: [] });
+    expect((await new ThreadRegistry(registry.path).get("disabled"))?.disabledPluginIds).toEqual(
+      []
+    );
+  });
+
+  it("migrates legacy dynamic tools and rejects corrupt definitions without losing valid threads", async () => {
+    const registry = await createRegistry();
+    const base = await registry.create({ backendSessionId: "session", backendType: "pi" });
+    const legacy = {
+      name: "click",
+      namespace: "gui",
+      description: "Click",
+      inputSchema: {},
+      exposeToContext: false,
+      authentication: "DO_NOT_COPY",
+    };
+    await writeFile(
+      registry.path,
+      JSON.stringify({
+        threads: [
+          { ...base, threadId: "legacy", dynamicTools: [legacy] },
+          { ...base, threadId: "old", dynamicTools: undefined },
+          { ...base, threadId: "corrupt", dynamicTools: [{ ...legacy, namespace: 12 }] },
+        ],
+      })
+    );
+    const warn = vi.fn();
+    const restored = new ThreadRegistry(registry.path, { warn });
+    expect((await restored.get("legacy"))?.dynamicTools).toEqual([
+      {
+        type: "namespace",
+        name: "gui",
+        description: "",
+        tools: [
+          {
+            type: "function",
+            name: "click",
+            description: "Click",
+            inputSchema: {},
+            deferLoading: true,
+          },
+        ],
+      },
+    ]);
+    expect((await restored.get("old"))?.dynamicTools).toEqual([]);
+    expect(await restored.get("corrupt")).toBeNull();
+    expect(warn).toHaveBeenCalledOnce();
+    await restored.update("legacy", { name: "Renamed" });
+    expect(await readFile(registry.path, "utf8")).not.toContain("DO_NOT_COPY");
+    expect((await new ThreadRegistry(registry.path).get("legacy"))?.dynamicTools).toEqual(
+      (await restored.get("legacy"))?.dynamicTools
+    );
+  });
   it("persists concurrent mutations in order even within the same millisecond", async () => {
     const registry = await createRegistry();
     const now = vi.spyOn(Date, "now").mockReturnValue(1);

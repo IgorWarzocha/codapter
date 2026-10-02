@@ -10,5 +10,8 @@
       "import": "./dist/index.js"
     }
   },
-  "files": ["dist"]
+  "files": ["dist"],
+  "dependencies": {
+    "smol-toml": "1.9.0"
+  }
 }

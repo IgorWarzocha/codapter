@@ -42,7 +42,11 @@ The default subprocess is `pi --mode rpc`. PATH wrappers are respected, includin
 
 Pi RPC cannot render custom terminal UI, keybindings, terminal widgets, or themes. Those features remain TUI-only. Desktop skill and plugin listings are not an inventory of your Pi extensions. An empty listing does not disable them.
 
-Tools supplied by desktop plugins are not forwarded into Pi. Ordinary text the GUI includes in a prompt reaches Pi, but plugin tool definitions and calls need a bridge that Codapter does not yet implement.
+Enabled local desktop plugins can supply skills and MCP tools to Pi. Desktop-provided tool calls return to the GUI, while MCP calls run through native Pi. ChatGPT apps reuse Pi's existing `openai-codex` sign-in. No second login or global Pi configuration copy is needed.
+
+Codapter reads desktop plugin settings and applies GUI changes to its own settings file. It does not install remote plugins or replace Pi's extension manager. Unsupported permission policies disable the affected integration with a diagnostic rather than silently granting access. See [API mapping](docs/api-mapping.md#desktop-capabilities) for the supported boundaries.
+
+Browser support uses Desktop's packaged browser host and sandbox, not a Codex app-server. Managed policies, macOS policy verification, and actions requiring Guardian auto-review are not supported and fail closed.
 
 Codapter's optional `--collab` extension adds adapter-managed child threads. It is separate from any sub-agent extension you already use in Pi, and is off by default. Native Pi sub-agent tools remain native.
 
@@ -79,7 +83,7 @@ export CODAPTER_PI_ARGS='["--mode","rpc","--provider","openai-codex","--model","
 
 The desktop can still override the model and effort for an individual thread or turn. For a Pi-only picker, also set `CODAPTER_CODEX_DISABLE=1`.
 
-Older releases defaulted to downloading `@mariozechner/pi-coding-agent` with `npx`. Install current Pi and configure it before upgrading. Explicit command and argument overrides still work. Both distribution files must stay together when deploying: `dist/codapter.mjs` and `dist/collab-extension.mjs`.
+Older releases defaulted to downloading `@mariozechner/pi-coding-agent` with `npx`. Install current Pi and configure it before upgrading. Explicit command and argument overrides still work. Keep all four distribution files together when deploying: `dist/codapter.mjs`, `dist/collab-extension.mjs`, `dist/desktop-extension.mjs`, and `dist/desktop-mcp-proxy.mjs`.
 
 ## Remote clients
 
@@ -111,9 +115,10 @@ The ordinary suite makes no inference calls. The opt-in live test uses your inst
 - **Wrong backend:** select a `pi::` model. Codex models use native unprefixed IDs.
 - **Extension waits for input:** look for a desktop user-input request. Custom TUI screens cannot be forwarded through Pi RPC.
 - **Separate test state:** set `CODAPTER_STATE_DIR` and `CODAPTER_CONFIG_FILE`. Do not delete your real thread registry to troubleshoot a fresh thread.
+- **Browser unavailable in an older thread:** start a new thread. Legacy records lack the policy information needed to resume Browser safely.
 - **Debugging:** pass `--remote-debugging-port=9233` to the launcher when needed. Logs contain prompts, file contents, and tool output. Do not publish them unredacted.
 
-Native Codex WebSocket proxying, PTY command execution, desktop worktree management, MCP management, and realtime voice are not implemented. This does not prevent Pi extensions from providing their own tools through Pi. See [API mapping](docs/api-mapping.md) for the supported surface.
+Native Codex WebSocket proxying, PTY command execution, desktop worktree management, remote plugin installation, and realtime voice are not implemented. Native Pi tools and extensions remain available independently of desktop plugins. See [API mapping](docs/api-mapping.md) for the supported surface.
 
 ## License
 

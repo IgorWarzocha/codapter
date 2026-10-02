@@ -110,7 +110,9 @@ export interface CollabManagerOptions {
   resolveThreadHandle(threadId: string): string;
   resolveThreadBackendType(threadId: string): string;
   createSessionLaunchConfig?(
-    threadId: string
+    threadId: string,
+    context?: ThreadExecutionContext | null,
+    backendType?: string
   ): BackendSessionLaunchConfig | Promise<BackendSessionLaunchConfig>;
   resolveThreadExecutionContext?(threadId: string): CollabThreadExecutionContext | null;
   createChildThread(input: CollabManagerCreateChildThreadInput): Promise<void>;
@@ -147,7 +149,9 @@ export class CollabManager {
   private readonly resolveThreadHandle: (threadId: string) => string;
   private readonly resolveThreadBackendType: (threadId: string) => string;
   private readonly createSessionLaunchConfig: (
-    threadId: string
+    threadId: string,
+    context?: ThreadExecutionContext | null,
+    backendType?: string
   ) => BackendSessionLaunchConfig | Promise<BackendSessionLaunchConfig>;
   private readonly resolveThreadExecutionContext: (
     threadId: string
@@ -203,7 +207,11 @@ export class CollabManager {
     }
 
     const parentContext = this.resolveThreadExecutionContext(req.parentThreadId);
-    const sessionLaunchConfig = await this.createSessionLaunchConfig(threadId);
+    const sessionLaunchConfig = await this.createSessionLaunchConfig(
+      threadId,
+      parentContext,
+      childBackend.backendType
+    );
     const useBackendFork = req.forkContext && parentBackendType !== "codex";
     const threadStart: BackendThreadStartResult | BackendThreadForkResult = useBackendFork
       ? await parentBackend.threadFork({

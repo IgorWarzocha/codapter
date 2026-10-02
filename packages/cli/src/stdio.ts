@@ -10,6 +10,8 @@ export function startStdioListener(
   let closing = false;
   const connection = new AppServerConnection({
     backendRouter: options.backendRouter,
+    configStore: options.configStore,
+    desktopPlugins: options.desktopPlugins,
     collabEnabled: options.collabEnabled,
     initialAuthState: options.initialAuthState ?? null,
     onMessage(message) {

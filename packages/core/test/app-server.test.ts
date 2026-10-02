@@ -1,7 +1,7 @@
-import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import net from "node:net";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import { describe, expect, it, vi } from "vitest";
 import { AppServerConnection } from "../src/app-server.js";
 import type {
@@ -15,6 +15,17 @@ import type {
 import { parseBackendModelId } from "../src/backend.js";
 import { BackendRouter } from "../src/backend-router.js";
 import { InMemoryConfigStore } from "../src/config-store.js";
+import { stringifyConfigToml } from "../src/config-toml.js";
+import { DesktopPluginCatalog } from "../src/desktop-plugins.js";
+import type {
+  ConfigReadResponse,
+  JsonValue,
+  PluginListResponse,
+  PluginReadResponse,
+  SkillsListResponse,
+  Thread,
+  UserInput,
+} from "../src/protocol.js";
 import { ThreadRegistry } from "../src/thread-registry.js";
 import { TurnStateMachine, toThreadTokenUsage } from "../src/turn-state.js";
 
@@ -397,7 +408,7 @@ class TestBackend implements IBackend {
     );
   }
 
-  private dispatchEvent(sessionId: string, event: BackendAppServerEvent) {
+  dispatchEvent(sessionId: string, event: BackendAppServerEvent) {
     for (const listener of this.listeners.get(sessionId) ?? []) {
       listener(event);
     }
@@ -772,6 +783,1497 @@ function callSocket(socketPath: string, payload: unknown): Promise<unknown> {
 }
 
 describe("AppServerConnection", () => {
+  it("validates canonical and legacy GUI dynamic tool definitions before starting a backend", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "codapter-desktop-tools-"));
+    const backend = new TestBackend();
+    const connection = new AppServerConnection({
+      backend,
+      threadRegistry: new ThreadRegistry(join(directory, "threads.json")),
+      configStore: new InMemoryConfigStore(join(directory, "config.json")),
+    });
+    const fn = {
+      type: "function",
+      name: "click",
+      description: "Click",
+      inputSchema: { type: "object" },
+    };
+    try {
+      await connection.handleMessage({
+        id: 1,
+        method: "initialize",
+        params: {
+          clientInfo: { name: "test", title: null, version: "1" },
+          capabilities: { experimentalApi: true },
+        },
+      });
+      const invalid = [
+        {},
+        [null],
+        [{ ...fn, name: "bad.name" }],
+        [{ ...fn, inputSchema: null }],
+        [{ ...fn, deferLoading: "false" }],
+        [{ ...fn, deferLoading: true }],
+        [fn, fn],
+        [{ type: "namespace", name: "gui", description: "GUI", tools: [] }],
+        [{ type: "namespace", name: "gui", description: "GUI", tools: [fn, fn] }],
+        [{ type: "namespace", name: "web", description: "Reserved", tools: [fn] }],
+        [fn, { name: "legacy", description: "Legacy", inputSchema: {} }],
+        [{ name: "legacy", namespace: 2, description: "Legacy", inputSchema: {} }],
+        [{ name: "legacy", description: "Legacy", inputSchema: {}, exposeToContext: false }],
+      ];
+      for (const dynamicTools of invalid) {
+        const result = await connection.handleMessage({
+          id: 2,
+          method: "thread/start",
+          params: { dynamicTools },
+        });
+        expect(result).toMatchObject({ error: { code: -32602 } });
+      }
+      expect(backend.threadStartCalls).toHaveLength(0);
+      const canonical = [
+        fn,
+        {
+          type: "namespace",
+          name: "gui",
+          description: "GUI",
+          tools: [{ ...fn, deferLoading: true }],
+        },
+      ];
+      expect(
+        await connection.handleMessage({
+          id: 3,
+          method: "thread/start",
+          params: { dynamicTools: canonical },
+        })
+      ).toHaveProperty("result.thread.id");
+      expect(backend.launchConfigs[0]?.launchConfig?.desktopCapabilities?.tools).toEqual([
+        {
+          namespace: null,
+          name: "click",
+          description: "Click",
+          inputSchema: { type: "object" },
+          deferLoading: false,
+        },
+        {
+          namespace: "gui",
+          name: "click",
+          description: "Click",
+          inputSchema: { type: "object" },
+          deferLoading: true,
+        },
+      ]);
+      const legacy = [
+        {
+          name: "click",
+          namespace: "gui",
+          description: "Click",
+          inputSchema: { type: "object" },
+          exposeToContext: false,
+          authentication: "DO_NOT_PERSIST",
+        },
+      ];
+      expect(
+        await connection.handleMessage({
+          id: 4,
+          method: "thread/start",
+          params: { dynamicTools: legacy },
+        })
+      ).toHaveProperty("result.thread.id");
+      expect(backend.threadStartCalls[1]?.dynamicTools).toEqual([
+        { type: "namespace", name: "gui", description: "", tools: [{ ...fn, deferLoading: true }] },
+      ]);
+      expect(await readFile(join(directory, "threads.json"), "utf8")).not.toContain(
+        "DO_NOT_PERSIST"
+      );
+    } finally {
+      await connection.dispose();
+      await rm(directory, { recursive: true, force: true });
+    }
+  });
+
+  it("restores GUI tools on cold resume and fork while refreshing capabilities and expanding Pi input", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "codapter-desktop-resume-"));
+    const backend = new TestBackend();
+    const registryPath = join(directory, "threads.json");
+    const configStore = new InMemoryConfigStore(join(directory, "config.json"));
+    const desktopPlugins = {
+      capabilities: vi.fn(async (_cwd: string, config: Record<string, unknown> | null) => ({
+        mcpServers: { gui: { url: String(config?.gui_url), bearer_token: "MCP_SECRET" } },
+        instructions: [String(config?.gui_instruction)],
+      })),
+      expandInput: vi.fn(async () => [
+        { type: "text" as const, text: "Expanded GUI skill", text_elements: [] },
+      ]),
+    };
+    configStore.writeBatch({
+      edits: [
+        { keyPath: "gui_url", value: "https://initial.example", mergeStrategy: "replace" },
+        { keyPath: "gui_instruction", value: "Initial instructions", mergeStrategy: "replace" },
+      ],
+    });
+    let connection = new AppServerConnection({
+      backend,
+      configStore,
+      desktopPlugins,
+      threadRegistry: new ThreadRegistry(registryPath),
+    });
+    const initialize = () =>
+      connection.handleMessage({
+        id: 1,
+        method: "initialize",
+        params: {
+          clientInfo: { name: "test", title: null, version: "1" },
+          capabilities: { experimentalApi: true },
+        },
+      });
+    try {
+      await initialize();
+      const started = (await connection.handleMessage({
+        id: 2,
+        method: "thread/start",
+        params: {
+          cwd: "/gui-project",
+          dynamicTools: [
+            {
+              type: "namespace",
+              name: "gui",
+              description: "GUI",
+              tools: [
+                {
+                  type: "function",
+                  name: "click",
+                  description: "Click",
+                  inputSchema: { type: "object" },
+                  deferLoading: true,
+                },
+              ],
+            },
+          ],
+        },
+      })) as { result: { thread: { id: string } } };
+      const threadId = started.result.thread.id;
+      const tools = backend.launchConfigs[0]?.launchConfig?.desktopCapabilities?.tools;
+      expect(backend.launchConfigs[0]?.launchConfig?.desktopCapabilities).not.toHaveProperty(
+        "browserConfig"
+      );
+      expect(backend.launchConfigs[0]?.launchConfig?.desktopCapabilities?.instructions).toEqual([
+        "Initial instructions",
+      ]);
+      expect(await readFile(registryPath, "utf8")).not.toContain("MCP_SECRET");
+      await connection.dispose();
+      connection = new AppServerConnection({
+        backend,
+        configStore,
+        desktopPlugins,
+        threadRegistry: new ThreadRegistry(registryPath),
+      });
+      await initialize();
+      await connection.handleMessage({ id: 3, method: "thread/resume", params: { threadId } });
+      expect(backend.launchConfigs[1]?.launchConfig?.desktopCapabilities?.tools).toEqual(tools);
+      const forked = (await connection.handleMessage({
+        id: 4,
+        method: "thread/fork",
+        params: { threadId },
+      })) as { result: { thread: { id: string } } };
+      expect(backend.launchConfigs[2]?.launchConfig?.desktopCapabilities?.tools).toEqual(tools);
+      expect(backend.launchConfigs[2]?.launchConfig?.desktopCapabilities?.instructions).toEqual([
+        "Initial instructions",
+      ]);
+      configStore.writeBatch({
+        edits: [
+          { keyPath: "gui_url", value: "https://refreshed.example", mergeStrategy: "replace" },
+          { keyPath: "gui_instruction", value: "Refreshed instructions", mergeStrategy: "replace" },
+        ],
+      });
+      await connection.handleMessage({
+        id: 5,
+        method: "turn/start",
+        params: {
+          threadId: forked.result.thread.id,
+          cwd: "/refreshed-project",
+          input: [{ type: "skill", name: "gui", path: "/skills/gui" }],
+        },
+      });
+      expect(backend.turnStartCalls[0]).toMatchObject({
+        input: [{ type: "text", text: "Expanded GUI skill", text_elements: [] }],
+        desktopCapabilities: {
+          tools,
+          instructions: ["Refreshed instructions"],
+          mcpServers: { gui: { url: "https://refreshed.example" } },
+        },
+      });
+      expect(desktopPlugins.capabilities).toHaveBeenLastCalledWith(
+        "/refreshed-project",
+        expect.objectContaining({ gui_url: "https://refreshed.example" })
+      );
+      expect(desktopPlugins.expandInput).toHaveBeenCalledWith(
+        [{ type: "skill", name: "gui", path: "/skills/gui" }],
+        "/refreshed-project"
+      );
+      expect(await readFile(registryPath, "utf8")).not.toContain("MCP_SECRET");
+    } finally {
+      await connection.dispose();
+      await rm(directory, { recursive: true, force: true });
+    }
+  });
+
+  it("leaves native Codex input and extensions outside the Pi capability catalog", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "codapter-native-capabilities-"));
+    const backend = new TestBackend(undefined, { backendType: "codex" });
+    const desktopPlugins = {
+      capabilities: vi.fn(async () => {
+        throw new Error("Pi-only catalog");
+      }),
+      expandInput: vi.fn(async () => {
+        throw new Error("Pi-only expansion");
+      }),
+    };
+    const connection = new AppServerConnection({
+      backend,
+      desktopPlugins,
+      configStore: new InMemoryConfigStore(join(directory, "config.json")),
+      threadRegistry: new ThreadRegistry(join(directory, "threads.json")),
+    });
+    try {
+      await connection.handleMessage({
+        id: 1,
+        method: "initialize",
+        params: {
+          clientInfo: { name: "test", title: null, version: "1" },
+          capabilities: { experimentalApi: true },
+        },
+      });
+      const dynamicTools = [
+        {
+          type: "function",
+          name: "click",
+          description: "Click",
+          inputSchema: {},
+          deferLoading: false,
+        },
+      ];
+      const start = (await connection.handleMessage({
+        id: 2,
+        method: "thread/start",
+        params: { dynamicTools },
+      })) as { result: { thread: { id: string } } };
+      const input = [
+        { type: "skill", name: "native", path: "/native/SKILL.md" },
+        { type: "mention", name: "native-plugin", path: "plugin://native-plugin" },
+      ];
+      expect(
+        await connection.handleMessage({
+          id: 3,
+          method: "turn/start",
+          params: { threadId: start.result.thread.id, input },
+        })
+      ).toHaveProperty("result.turn.id");
+      expect(backend.threadStartCalls[0]?.dynamicTools).toEqual(dynamicTools);
+      expect(backend.turnStartCalls[0]?.input).toEqual(input);
+      expect(backend.turnStartCalls[0]).not.toHaveProperty("desktopCapabilities");
+      expect(backend.launchConfigs[0]?.launchConfig).not.toHaveProperty("desktopCapabilities");
+      expect(desktopPlugins.capabilities).not.toHaveBeenCalled();
+      expect(desktopPlugins.expandInput).not.toHaveBeenCalled();
+    } finally {
+      await connection.dispose();
+      await rm(directory, { recursive: true, force: true });
+    }
+  });
+
+  it("keeps scoped GUI calls raw and correlates result and error responses after unsubscribe", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "codapter-desktop-call-"));
+    const backend = new TestBackend();
+    const outbound: Array<Record<string, unknown>> = [];
+    const connection = new AppServerConnection({
+      backend,
+      configStore: new InMemoryConfigStore(join(directory, "config.json")),
+      threadRegistry: new ThreadRegistry(join(directory, "threads.json")),
+      onMessage: (message) => {
+        outbound.push(message as Record<string, unknown>);
+      },
+    });
+    try {
+      await connection.handleMessage({
+        id: 1,
+        method: "initialize",
+        params: {
+          clientInfo: { name: "test", title: null, version: "1" },
+          capabilities: { experimentalApi: true },
+        },
+      });
+      const start = (await connection.handleMessage({
+        id: 2,
+        method: "thread/start",
+        params: {},
+      })) as { result: { thread: { id: string } } };
+      const threadId = start.result.thread.id;
+      const args = {
+        selector: "#save",
+        threadId: "session_1",
+        thread: { id: "session_1" },
+        nested: {
+          namespace: "untouched",
+          tool: "also_untouched",
+          arguments: [1, false, null],
+          threadId: "session_1",
+        },
+      };
+      for (const suffix of ["success", "error"]) {
+        backend.dispatchEvent("session_1", {
+          kind: "serverRequest",
+          threadHandle: "session_1",
+          requestId: `backend-${suffix}`,
+          method: "item/tool/call",
+          params: {
+            threadId: "session_1",
+            turnId: "turn-1",
+            callId: `call-${suffix}`,
+            namespace: "gui",
+            tool: "click",
+            arguments: args,
+          },
+        });
+      }
+      await vi.waitFor(() =>
+        expect(outbound.filter((message) => message.method === "item/tool/call")).toHaveLength(2)
+      );
+      await connection.handleMessage({ id: 3, method: "thread/unsubscribe", params: { threadId } });
+      const requests = outbound.filter((message) => message.method === "item/tool/call");
+      expect(requests[0]).toMatchObject({
+        params: { threadId, namespace: "gui", tool: "click", arguments: args },
+      });
+      expect(requests[0]?.id).not.toBe("backend-success");
+      const result = { success: true, contentItems: [{ type: "inputText", text: "clicked" }] };
+      const error = { code: -32000, message: "GUI disconnected", data: { retry: false } };
+      await connection.handleMessage({ id: String(requests[0]?.id), result });
+      await connection.handleMessage({ id: String(requests[1]?.id), error });
+      expect(backend.elicitationResponses).toEqual([
+        { sessionId: "session_1", requestId: "backend-success", response: { result } },
+        { sessionId: "session_1", requestId: "backend-error", response: { error } },
+      ]);
+    } finally {
+      await connection.dispose();
+      await rm(directory, { recursive: true, force: true });
+    }
+  });
+  it("uses one native catalogue for GUI inventory, config overlays, and Pi launch instructions", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "codapter-desktop-routes-"));
+    const home = join(directory, "codex");
+    const marketplace = join(directory, "bundled");
+    const root = join(marketplace, "plugins", "browser");
+    const skill = join(root, "skills", "control", "SKILL.md");
+    const files = [
+      [
+        join(marketplace, ".agents", "plugins", "marketplace.json"),
+        JSON.stringify({
+          name: "bundled",
+          plugins: [
+            { name: "browser", source: { source: "local", path: "./plugins/browser" } },
+            { name: "uninstalled", source: { source: "local", path: "./missing" } },
+          ],
+        }),
+      ],
+      [
+        join(root, ".codex-plugin", "plugin.json"),
+        JSON.stringify({ name: "browser", version: "1", skills: "./skills" }),
+      ],
+      [
+        skill,
+        "---\nname: control-in-app-browser\ndescription: Browser controls.\n---\nSELECTED_FULL_SKILL\n",
+      ],
+      [
+        join(home, "config.toml"),
+        stringifyConfigToml({
+          model: "native-must-not-win",
+          model_reasoning_effort: "high",
+          features: { apps: false },
+          marketplaces: { bundled: { source_type: "local", source: marketplace } },
+          plugins: { "browser@bundled": { enabled: true } },
+        }),
+      ],
+    ];
+    for (const [path, contents] of files) {
+      await mkdir(dirname(path), { recursive: true });
+      await writeFile(path, contents);
+    }
+    const configStore = new InMemoryConfigStore(join(directory, "adapter.toml"));
+    const catalog = new DesktopPluginCatalog({
+      codexHome: home,
+      configStore,
+      systemConfigFile: join(directory, "system.toml"),
+      overrides: ["features.apps=true"],
+    });
+    const backend = new TestBackend();
+    const connection = new AppServerConnection({
+      backend,
+      configStore,
+      desktopPlugins: catalog,
+      threadRegistry: new ThreadRegistry(join(directory, "threads.json")),
+    });
+    try {
+      await connection.handleMessage({
+        id: 1,
+        method: "initialize",
+        params: {
+          clientInfo: { name: "test", title: null, version: "1" },
+          capabilities: { experimentalApi: true },
+        },
+      });
+      const list = (await connection.handleMessage({
+        id: 2,
+        method: "plugin/list",
+        params: { cwds: [directory] },
+      })) as { result: PluginListResponse };
+      expect(list.result).toMatchObject({
+        marketplaces: [
+          {
+            plugins: [
+              { name: "browser", installed: true, enabled: true },
+              { name: "uninstalled", installed: false },
+            ],
+          },
+        ],
+      });
+      const installed = await connection.handleMessage({
+        id: 3,
+        method: "plugin/installed",
+        params: {},
+      });
+      expect(installed).toMatchObject({
+        result: { marketplaces: [{ plugins: [{ name: "browser" }] }] },
+      });
+      expect(JSON.stringify(installed)).not.toContain('"name":"uninstalled"');
+      const suggested = await connection.handleMessage({
+        id: 4,
+        method: "plugin/installed",
+        params: { installSuggestionPluginNames: ["uninstalled"] },
+      });
+      expect(JSON.stringify(suggested)).toContain('"name":"uninstalled"');
+      const detail = (await connection.handleMessage({
+        id: 5,
+        method: "plugin/read",
+        params: {
+          pluginName: "browser",
+          marketplacePath: join(marketplace, ".agents", "plugins", "marketplace.json"),
+        },
+      })) as { result: PluginReadResponse };
+      expect(detail.result).toMatchObject({
+        plugin: { summary: { id: "browser@bundled" }, skills: [{ path: skill, enabled: true }] },
+      });
+      const skills = (await connection.handleMessage({
+        id: 6,
+        method: "skills/list",
+        params: { cwds: [directory] },
+      })) as { result: SkillsListResponse };
+      expect(skills.result).toMatchObject({
+        data: [{ cwd: directory, skills: [{ path: skill, enabled: true, scope: "plugin" }] }],
+      });
+      const config = (await connection.handleMessage({
+        id: 7,
+        method: "config/read",
+        params: { includeLayers: true, cwd: directory },
+      })) as { result: ConfigReadResponse };
+      expect(config.result.config).toMatchObject({
+        model: null,
+        model_reasoning_effort: null,
+        features: { apps: true },
+        plugins: { "browser@bundled": { enabled: true } },
+      });
+      expect(config.result.layers).toHaveLength(3);
+      expect(config.result.origins.features?.name).toEqual({ type: "sessionFlags" });
+      expect(config.result.layers?.[0]?.config).not.toHaveProperty("model");
+      expect(configStore.read({ includeLayers: false }).config).not.toHaveProperty("marketplaces");
+      const start = (await connection.handleMessage({
+        id: 8,
+        method: "thread/start",
+        params: {
+          cwd: directory,
+          config: {
+            "features.apps": false,
+            "mcp_servers.node_repl": {
+              command: "gui-node",
+              args: ["/gui/runtime.mjs"],
+              env: { NODE_REPL_NATIVE_MODULE_DIR: "/gui/modules" },
+            },
+          },
+        },
+      })) as { result: { thread: { id: string } } };
+      expect(
+        backend.launchConfigs[0]?.launchConfig?.desktopCapabilities?.instructions.join("\n")
+      ).toContain(skill);
+      expect(backend.launchConfigs[0]?.launchConfig?.desktopCapabilities?.mcpServers).toEqual({
+        node_repl: {
+          command: "gui-node",
+          args: ["/gui/runtime.mjs"],
+          env: { NODE_REPL_NATIVE_MODULE_DIR: "/gui/modules" },
+          cwd: directory,
+          exposure: "codemode",
+        },
+      });
+      await connection.handleMessage({
+        id: 9,
+        method: "turn/start",
+        params: {
+          threadId: start.result.thread.id,
+          input: [{ type: "skill", name: "control-in-app-browser", path: skill }],
+        },
+      });
+      expect(JSON.stringify(backend.turnStartCalls[0]?.input)).toContain("SELECTED_FULL_SKILL");
+      expect(backend.turnStartCalls[0]?.desktopCapabilities).toMatchObject({
+        mcpServers: {
+          node_repl: { command: "gui-node", env: { NODE_REPL_NATIVE_MODULE_DIR: "/gui/modules" } },
+        },
+      });
+      await connection.handleMessage({
+        id: 10,
+        method: "config/value/write",
+        params: {
+          keyPath: 'plugins."browser@bundled".enabled',
+          value: false,
+          mergeStrategy: "replace",
+        },
+      });
+      const disabled = await connection.handleMessage({
+        id: 11,
+        method: "plugin/read",
+        params: { pluginName: "browser" },
+      });
+      expect(disabled).toMatchObject({
+        result: { plugin: { summary: { enabled: false }, skills: [{ enabled: false }] } },
+      });
+      await connection.handleMessage({
+        id: 12,
+        method: "config/value/write",
+        params: { keyPath: "features.apps", value: false, mergeStrategy: "replace" },
+      });
+      const overridden = (await connection.handleMessage({
+        id: 13,
+        method: "config/read",
+        params: { includeLayers: false },
+      })) as { result: ConfigReadResponse };
+      expect(overridden.result).toMatchObject({
+        layers: null,
+        config: {
+          model: null,
+          features: { apps: false },
+          plugins: { "browser@bundled": { enabled: false } },
+        },
+        origins: { features: { name: { type: "user", file: join(directory, "adapter.toml") } } },
+      });
+      expect(
+        await connection.handleMessage({ id: 14, method: "plugin/read", params: {} })
+      ).toMatchObject({ error: { code: -32602 } });
+    } finally {
+      await connection.dispose();
+      await rm(directory, { recursive: true, force: true });
+    }
+  });
+
+  it("delivers effective Browser policy at launch, turn, and partial same-connection resume", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "codapter-browser-policy-"));
+    const home = join(directory, "codex");
+    const systemConfigFile = join(directory, "system.toml");
+    await mkdir(home);
+    await writeFile(
+      join(home, "config.toml"),
+      stringifyConfigToml({
+        model: "NOT_A_PI_OVERRIDE",
+        browser_use: { allow_history_access: false },
+        application: { enabled: false },
+      })
+    );
+    const configStore = new InMemoryConfigStore(join(directory, "adapter.toml"));
+    const catalog = new DesktopPluginCatalog({
+      codexHome: home,
+      configStore,
+      systemConfigFile,
+      overrides: ['browser_use.default_origin_policy.access="deny"'],
+    });
+    const backend = new TestBackend();
+    const registryPath = join(directory, "threads.json");
+    const connection = new AppServerConnection({
+      backend,
+      configStore,
+      desktopPlugins: catalog,
+      threadRegistry: new ThreadRegistry(registryPath),
+    });
+    try {
+      await connection.handleMessage({
+        id: 1,
+        method: "initialize",
+        params: {
+          clientInfo: { name: "test", title: null, version: "1" },
+          capabilities: { experimentalApi: true },
+        },
+      });
+      const start = (await connection.handleMessage({
+        id: 2,
+        method: "thread/start",
+        params: {
+          cwd: directory,
+          config: {
+            'browser_use.origins."https://blocked.test".access': "deny",
+            "mcp_servers.secret": { command: "fixture", env: { TOKEN: "DO_NOT_PERSIST" } },
+          },
+        },
+      })) as { result: { thread: { id: string } } };
+      const threadId = start.result.thread.id;
+      const initial = backend.launchConfigs[0]?.launchConfig?.desktopCapabilities?.browserConfig;
+      expect(initial).toEqual({
+        config: {
+          browser_use: {
+            allow_history_access: false,
+            default_origin_policy: { access: "deny" },
+            origins: { "https://blocked.test": { access: "deny" } },
+          },
+          application: { enabled: false },
+        },
+      });
+      expect(JSON.stringify(initial)).not.toContain("NOT_A_PI_OVERRIDE");
+      const resume = async (config: Record<string, JsonValue>) => {
+        const response = await connection.handleMessage({
+          id: 3,
+          method: "thread/resume",
+          params: { threadId, config },
+        });
+        expect(response).toHaveProperty("result.thread.id", threadId);
+        return backend.launchConfigs.at(-1)?.launchConfig?.desktopCapabilities;
+      };
+      const partial = await resume({ "features.apps": true });
+      expect(partial?.browserConfig).toEqual(initial);
+      expect(partial?.mcpServers).not.toHaveProperty("secret");
+      const updated = await resume({
+        browser_use: {
+          origins: { "https://blocked.test": { access: "allow", downloads: "deny" } },
+        },
+      });
+      expect(updated?.browserConfig).toMatchObject({
+        config: {
+          browser_use: {
+            allow_history_access: false,
+            default_origin_policy: { access: "deny" },
+            origins: { "https://blocked.test": { access: "allow", downloads: "deny" } },
+          },
+        },
+      });
+      expect(await readFile(registryPath, "utf8")).not.toContain("DO_NOT_PERSIST");
+      const turn = await connection.handleMessage({
+        id: 4,
+        method: "turn/start",
+        params: {
+          threadId,
+          input: [{ type: "text", text: "fixture", text_elements: [] }],
+        },
+      });
+      expect(turn).toHaveProperty("result.turn.id");
+      expect(backend.turnStartCalls[0]?.desktopCapabilities?.browserConfig).toEqual(
+        updated?.browserConfig
+      );
+      expect(initial).toMatchObject({
+        config: {
+          browser_use: {
+            origins: { "https://blocked.test": { access: "deny" } },
+          },
+        },
+      });
+      await writeFile(systemConfigFile, "[browser_use]\nallow_history_access = false\n");
+      const rejected = await resume({ "features.apps": true });
+      expect(rejected?.browserConfig).toEqual({
+        error: "Browser policy in native system configuration is unsupported",
+      });
+    } finally {
+      await connection.dispose();
+      await rm(directory, { recursive: true, force: true });
+    }
+  });
+
+  it("retains thread Browser denies across cold registry reload while freshly evaluating native base policy", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "codapter-browser-cold-resume-"));
+    const home = join(directory, "codex");
+    const nativeFile = join(home, "config.toml");
+    const registryPath = join(directory, "threads.json");
+    await mkdir(home);
+    await writeFile(
+      nativeFile,
+      stringifyConfigToml({
+        browser_use: { default_origin_policy: { downloads: "allow" } },
+      })
+    );
+    const backend = new TestBackend();
+    const createConnection = () => {
+      const configStore = new InMemoryConfigStore(join(directory, "adapter.toml"));
+      return new AppServerConnection({
+        backend,
+        configStore,
+        desktopPlugins: new DesktopPluginCatalog({
+          codexHome: home,
+          configStore,
+          systemConfigFile: join(directory, "system.toml"),
+        }),
+        threadRegistry: new ThreadRegistry(registryPath),
+      });
+    };
+    let connection = createConnection();
+    const initialize = () =>
+      connection.handleMessage({
+        id: 1,
+        method: "initialize",
+        params: {
+          clientInfo: { name: "test", title: null, version: "1" },
+          capabilities: { experimentalApi: true },
+        },
+      });
+    try {
+      await initialize();
+      const start = (await connection.handleMessage({
+        id: 2,
+        method: "thread/start",
+        params: {
+          cwd: directory,
+          config: {
+            "browser_use.default_origin_policy.access": "deny",
+            "browser_use.allow_history_access": false,
+            'browser_use.origins."https://blocked.test".uploads': "deny",
+            'application.network.domains."thread.test"': "deny",
+            profile: "selected",
+            profiles: {
+              selected: {
+                model: "DO_NOT_PERSIST",
+                mcp_servers: { secret: { env: { TOKEN: "DO_NOT_PERSIST" } } },
+              },
+            },
+            "mcp_servers.secret": { command: "fixture", env: { TOKEN: "DO_NOT_PERSIST" } },
+          },
+        },
+      })) as { result: { thread: { id: string } } };
+      const threadId = start.result.thread.id;
+      expect(
+        backend.launchConfigs[0]?.launchConfig?.desktopCapabilities?.browserConfig
+      ).toMatchObject({
+        config: {
+          browser_use: {
+            allow_history_access: false,
+            default_origin_policy: { access: "deny", downloads: "allow" },
+          },
+        },
+      });
+      const saved = (await new ThreadRegistry(registryPath).get(threadId))?.browserOverrides;
+      expect(saved).toEqual({
+        browser_use: {
+          allow_history_access: false,
+          default_origin_policy: { access: "deny" },
+          origins: { "https://blocked.test": { uploads: "deny" } },
+        },
+        application: { network: { domains: { "thread.test": "deny" } } },
+        profile: "selected",
+        profiles: { selected: {} },
+      });
+      expect(await readFile(registryPath, "utf8")).not.toContain("DO_NOT_PERSIST");
+      await connection.dispose();
+      await writeFile(
+        nativeFile,
+        stringifyConfigToml({
+          browser_use: {
+            allow_history_access: true,
+            default_origin_policy: { downloads: "deny", full_cdp_access: "deny" },
+          },
+          application: { network: { enabled: true, domains: { "native.test": "deny" } } },
+        })
+      );
+      connection = createConnection();
+      await initialize();
+      const resumed = await connection.handleMessage({
+        id: 3,
+        method: "thread/resume",
+        params: {
+          threadId,
+          config: { "features.apps": true },
+        },
+      });
+      expect(resumed).toHaveProperty("result.thread.id", threadId);
+      const expected = {
+        config: {
+          browser_use: {
+            allow_history_access: false,
+            default_origin_policy: { access: "deny", downloads: "deny", full_cdp_access: "deny" },
+            origins: { "https://blocked.test": { uploads: "deny" } },
+          },
+          application: {
+            network: { enabled: true, domains: { "native.test": "deny", "thread.test": "deny" } },
+          },
+        },
+      };
+      const cold = backend.launchConfigs.at(-1)?.launchConfig?.desktopCapabilities;
+      expect(cold?.browserConfig).toEqual(expected);
+      expect(cold?.mcpServers).not.toHaveProperty("secret");
+      expect((await new ThreadRegistry(registryPath).get(threadId))?.browserOverrides).toEqual(
+        saved
+      );
+      const fork = (await connection.handleMessage({
+        id: 4,
+        method: "thread/fork",
+        params: {
+          threadId,
+          config: { "features.apps": false },
+        },
+      })) as { result: { thread: { id: string } } };
+      expect(
+        backend.launchConfigs.at(-1)?.launchConfig?.desktopCapabilities?.browserConfig
+      ).toEqual(expected);
+      expect(
+        (await new ThreadRegistry(registryPath).get(fork.result.thread.id))?.browserOverrides
+      ).toEqual(saved);
+      await connection.dispose();
+      connection = createConnection();
+      await initialize();
+      expect(
+        await connection.handleMessage({ id: 5, method: "thread/resume", params: { threadId } })
+      ).toHaveProperty("result.thread.id", threadId);
+      expect(
+        backend.launchConfigs.at(-1)?.launchConfig?.desktopCapabilities?.browserConfig
+      ).toEqual(expected);
+      const turn = await connection.handleMessage({
+        id: 6,
+        method: "turn/start",
+        params: {
+          threadId,
+          input: [{ type: "text", text: "fixture", text_elements: [] }],
+        },
+      });
+      expect(turn).toHaveProperty("result.turn.id");
+      expect(backend.turnStartCalls.at(-1)?.desktopCapabilities?.browserConfig).toEqual(expected);
+      expect(await readFile(registryPath, "utf8")).not.toContain("DO_NOT_PERSIST");
+    } finally {
+      await connection.dispose();
+      await rm(directory, { recursive: true, force: true });
+    }
+  });
+
+  it("fails Browser access closed for legacy threads lacking persisted overrides until complete policy resupply", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "codapter-browser-legacy-resume-"));
+    const registryPath = join(directory, "threads.json");
+    const registry = new ThreadRegistry(registryPath);
+    const backend = new TestBackend();
+    const native = await backend.threadStart({
+      threadId: "legacy",
+      cwd: directory,
+      model: null,
+      reasoningEffort: null,
+    });
+    const entry = await registry.create({
+      threadId: "legacy",
+      backendType: "pi",
+      backendSessionId: native.threadHandle,
+      cwd: directory,
+    });
+    await writeFile(
+      registryPath,
+      JSON.stringify({ threads: [{ ...entry, browserOverrides: undefined }] })
+    );
+    const configStore = new InMemoryConfigStore(join(directory, "adapter.toml"));
+    const connection = new AppServerConnection({
+      backend,
+      configStore,
+      threadRegistry: new ThreadRegistry(registryPath),
+      desktopPlugins: new DesktopPluginCatalog({
+        codexHome: join(directory, "codex"),
+        configStore,
+        systemConfigFile: join(directory, "system.toml"),
+      }),
+    });
+    try {
+      await connection.handleMessage({
+        id: 1,
+        method: "initialize",
+        params: {
+          clientInfo: { name: "test", title: null, version: "1" },
+          capabilities: { experimentalApi: true },
+        },
+      });
+      for (let attempt = 0; attempt < 2; attempt++) {
+        expect(
+          await connection.handleMessage({
+            id: 2,
+            method: "thread/resume",
+            params: {
+              threadId: "legacy",
+              config: { "features.apps": true },
+            },
+          })
+        ).toHaveProperty("result.thread.id", "legacy");
+        expect(
+          backend.launchConfigs.at(-1)?.launchConfig?.desktopCapabilities?.browserConfig
+        ).toEqual({
+          error: "Original thread Browser overrides are unavailable",
+        });
+      }
+      expect((await new ThreadRegistry(registryPath).get("legacy"))?.browserOverrides).toBeNull();
+      expect(
+        await connection.handleMessage({
+          id: 3,
+          method: "turn/start",
+          params: {
+            threadId: "legacy",
+            input: [{ type: "text", text: "fixture", text_elements: [] }],
+          },
+        })
+      ).toHaveProperty("result.turn.id");
+      expect(backend.turnStartCalls.at(-1)?.desktopCapabilities?.browserConfig).toEqual({
+        error: "Original thread Browser overrides are unavailable",
+      });
+      expect(
+        await connection.handleMessage({
+          id: 4,
+          method: "thread/resume",
+          params: {
+            threadId: "legacy",
+            config: {
+              browser_use: { allow_history_access: false },
+              application: null,
+              profile: null,
+            },
+          },
+        })
+      ).toHaveProperty("result.thread.id", "legacy");
+      expect(
+        backend.launchConfigs.at(-1)?.launchConfig?.desktopCapabilities?.browserConfig
+      ).toEqual({
+        config: { browser_use: { allow_history_access: false }, application: null },
+      });
+      expect((await new ThreadRegistry(registryPath).get("legacy"))?.browserOverrides).toEqual({
+        browser_use: { allow_history_access: false },
+        application: null,
+        profile: null,
+      });
+    } finally {
+      await connection.dispose();
+      await rm(directory, { recursive: true, force: true });
+    }
+  });
+
+  it("keeps native Browser services aligned and persists replaceable disabledPluginIds across turns, forks, and resume", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "codapter-browser-service-"));
+    const home = join(directory, "codex");
+    const marketplace = join(home, ".tmp", "bundled-marketplaces", "openai-bundled");
+    const root = join(marketplace, "plugins", "browser");
+    const skill = join(root, "skills", "control", "SKILL.md");
+    const service = join(root, "scripts", "browser-service.mjs");
+    const cached = join(
+      home,
+      "plugins",
+      "cache",
+      "openai-bundled",
+      "browser",
+      "26.928.31416",
+      "scripts",
+      "browser-service.mjs"
+    );
+    const pluginId = "browser@openai-bundled";
+    const files = [
+      [
+        join(marketplace, ".agents", "plugins", "marketplace.json"),
+        JSON.stringify({
+          name: "openai-bundled",
+          plugins: [{ name: "browser", source: { source: "local", path: "./plugins/browser" } }],
+        }),
+      ],
+      [
+        join(root, ".codex-plugin", "plugin.json"),
+        JSON.stringify({ name: "browser", version: "26.928.31416", skills: "./skills" }),
+      ],
+      [
+        join(root, ".mcp.json"),
+        JSON.stringify({ mcpServers: { browser_only: { command: "browser-mcp" } } }),
+      ],
+      [
+        skill,
+        "---\nname: control-in-app-browser\ndescription: Browser controls.\n---\nCURRENT_BROWSER_SKILL\n",
+      ],
+      [service, "export const current = true;\n"],
+      [
+        join(home, "config.toml"),
+        stringifyConfigToml({
+          features: { apps: false },
+          marketplaces: { "openai-bundled": { source_type: "local", source: marketplace } },
+          plugins: { [pluginId]: { enabled: true } },
+        }),
+      ],
+    ];
+    for (const [path, contents] of files) {
+      await mkdir(dirname(path), { recursive: true });
+      await writeFile(path, contents);
+    }
+    const configStore = new InMemoryConfigStore(join(directory, "adapter.toml"));
+    const catalog = new DesktopPluginCatalog({
+      codexHome: home,
+      configStore,
+      systemConfigFile: join(directory, "system.toml"),
+    });
+    const backend = new TestBackend(({ sessionId, turnId }) =>
+      backend.emit(sessionId, { type: "message_end", sessionId, turnId })
+    );
+    const statePath = join(directory, "threads.json");
+    const outbound: Array<Record<string, unknown>> = [];
+    const createConnection = () =>
+      new AppServerConnection({
+        backend,
+        configStore,
+        desktopPlugins: catalog,
+        threadRegistry: new ThreadRegistry(statePath),
+        onMessage: (message) => {
+          outbound.push(message as Record<string, unknown>);
+        },
+      });
+    let connection = createConnection();
+    const initialize = () =>
+      connection.handleMessage({
+        id: 1,
+        method: "initialize",
+        params: {
+          clientInfo: { name: "test", title: null, version: "1" },
+          capabilities: { experimentalApi: true },
+        },
+      });
+    const threadConfig = {
+      "mcp_servers.node_repl": {
+        command: "node",
+        env: {
+          NODE_REPL_TRUSTED_SERVICES: JSON.stringify({
+            browser: cached,
+            unrelated: "/unrelated/service.mjs",
+          }),
+          NODE_REPL_TRUSTED_CODE_PATHS: home,
+          CODEX_CLI_PATH: "/gui/cli-tap",
+        },
+      },
+    };
+    try {
+      await initialize();
+      const started = (await connection.handleMessage({
+        id: 2,
+        method: "thread/start",
+        params: { cwd: directory, config: threadConfig },
+      })) as { result: { thread: { id: string }; disabledPluginIds: string[] } };
+      const threadId = started.result.thread.id;
+      expect(started.result.disabledPluginIds).toEqual([]);
+      expect(
+        backend.launchConfigs[0]?.launchConfig?.desktopCapabilities?.mcpServers.node_repl
+      ).toMatchObject({
+        env: {
+          NODE_REPL_TRUSTED_SERVICES: JSON.stringify({
+            browser: service,
+            unrelated: "/unrelated/service.mjs",
+          }),
+          CODEX_CLI_PATH: "/gui/cli-tap",
+          NODE_REPL_TRUSTED_CODE_PATHS: home,
+        },
+      });
+      await expect(readFile(cached)).rejects.toMatchObject({ code: "ENOENT" });
+      const runTurn = async (
+        ids: string[] | null | undefined,
+        input: UserInput[] = [{ type: "text", text: "check", text_elements: [] }]
+      ) => {
+        const completed = outbound.filter((message) => message.method === "turn/completed").length;
+        const response = await connection.handleMessage({
+          id: 3,
+          method: "turn/start",
+          params: { threadId, input, ...(ids === undefined ? {} : { disabledPluginIds: ids }) },
+        });
+        expect(response).not.toHaveProperty("error");
+        await vi.waitFor(() => {
+          expect(outbound.filter((message) => message.method === "turn/completed")).toHaveLength(
+            completed + 1
+          );
+          expect(outbound.at(-1)).toMatchObject({
+            method: "thread/status/changed",
+            params: { status: { type: "idle" } },
+          });
+        });
+        return backend.turnStartCalls.at(-1);
+      };
+      for (const ids of [[pluginId], undefined, null]) {
+        const turn = await runTurn(ids);
+        expect(turn?.desktopCapabilities).toMatchObject({
+          mcpServers: {
+            node_repl: {
+              env: {
+                NODE_REPL_TRUSTED_SERVICES: JSON.stringify({ unrelated: "/unrelated/service.mjs" }),
+              },
+            },
+          },
+        });
+        expect(JSON.stringify(turn?.desktopCapabilities)).not.toContain(skill);
+        expect(JSON.stringify(turn?.desktopCapabilities)).not.toContain("browser_only");
+        expect(JSON.stringify(turn?.desktopCapabilities)).not.toContain(cached);
+      }
+      expect(backend.turnStartCalls[0]?.disabledPluginIds).toEqual([pluginId]);
+      expect(backend.turnStartCalls[1]).not.toHaveProperty("disabledPluginIds");
+      const invalid = await connection.handleMessage({
+        id: 4,
+        method: "turn/start",
+        params: { threadId, disabledPluginIds: [123], input: [] },
+      });
+      expect(invalid).toMatchObject({ error: { code: -32602 } });
+      const rejected = await connection.handleMessage({
+        id: 5,
+        method: "turn/start",
+        params: {
+          threadId,
+          input: [{ type: "skill", name: "control-in-app-browser", path: skill }],
+        },
+      });
+      expect(rejected).toMatchObject({ error: { message: expect.stringContaining("disabled") } });
+      expect(backend.turnStartCalls).toHaveLength(3);
+      const fork = await connection.handleMessage({
+        id: 6,
+        method: "thread/fork",
+        params: { threadId },
+      });
+      expect(fork).toMatchObject({ result: { disabledPluginIds: [pluginId] } });
+      expect(
+        backend.launchConfigs[1]?.launchConfig?.desktopCapabilities?.mcpServers.node_repl
+      ).toMatchObject({
+        env: {
+          NODE_REPL_TRUSTED_SERVICES: JSON.stringify({ unrelated: "/unrelated/service.mjs" }),
+        },
+      });
+      await connection.dispose();
+      connection = createConnection();
+      await initialize();
+      const resumed = await connection.handleMessage({
+        id: 7,
+        method: "thread/resume",
+        params: { threadId, config: threadConfig },
+      });
+      expect(resumed).toMatchObject({ result: { disabledPluginIds: [pluginId] } });
+      expect(
+        backend.launchConfigs[2]?.launchConfig?.desktopCapabilities?.mcpServers.node_repl
+      ).toMatchObject({
+        env: {
+          NODE_REPL_TRUSTED_SERVICES: JSON.stringify({ unrelated: "/unrelated/service.mjs" }),
+        },
+      });
+      const enabled = await runTurn(
+        [],
+        [{ type: "skill", name: "control-in-app-browser", path: skill }]
+      );
+      expect(enabled?.disabledPluginIds).toEqual([]);
+      expect(JSON.stringify(enabled?.input)).toContain("CURRENT_BROWSER_SKILL");
+      expect(enabled?.desktopCapabilities).toMatchObject({
+        mcpServers: {
+          node_repl: {
+            env: {
+              NODE_REPL_TRUSTED_SERVICES: JSON.stringify({
+                browser: service,
+                unrelated: "/unrelated/service.mjs",
+              }),
+            },
+          },
+          browser_only: { command: "browser-mcp" },
+        },
+        instructions: expect.arrayContaining([expect.stringContaining(skill)]),
+      });
+      expect((await new ThreadRegistry(statePath).get(threadId))?.disabledPluginIds).toEqual([]);
+      expect(JSON.stringify((await runTurn(undefined))?.desktopCapabilities)).toContain(service);
+      await expect(readFile(cached)).rejects.toMatchObject({ code: "ENOENT" });
+    } finally {
+      await connection.dispose();
+      await rm(directory, { recursive: true, force: true });
+    }
+  });
+
+  it("publishes canonical raw MCP items and keeps widget metadata in current-runtime history", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "codapter-mcp-events-"));
+    const backend = new TestBackend();
+    const outbound: Array<Record<string, unknown>> = [];
+    const logger = { warn: vi.fn() };
+    const connection = new AppServerConnection({
+      backend,
+      logger,
+      configStore: new InMemoryConfigStore(join(directory, "adapter.toml")),
+      threadRegistry: new ThreadRegistry(join(directory, "threads.json")),
+      onMessage: (message) => {
+        outbound.push(message as Record<string, unknown>);
+      },
+    });
+    try {
+      await connection.handleMessage({
+        id: 1,
+        method: "initialize",
+        params: {
+          clientInfo: { name: "test", title: null, version: "1" },
+          capabilities: { experimentalApi: true },
+        },
+      });
+      const start = (await connection.handleMessage({
+        id: 2,
+        method: "thread/start",
+        params: {},
+      })) as { result: { thread: { id: string } } };
+      const threadId = start.result.thread.id;
+      const turn = (await connection.handleMessage({
+        id: 3,
+        method: "turn/start",
+        params: { threadId, input: [{ type: "text", text: "check", text_elements: [] }] },
+      })) as { result: { turn: { id: string } } };
+      const turnId = turn.result.turn.id;
+      const args = { threadId: "session_1", thread: { id: "session_1" }, nested: [false, null, 1] };
+      const result = {
+        content: [
+          {
+            type: "resource",
+            resource: {
+              uri: "ui://widget/board",
+              mimeType: "text/html",
+              text: "widget",
+              _meta: { threadId: "session_1" },
+            },
+          },
+        ],
+        structuredContent: { board: [1, 2] },
+        _meta: {
+          "openai/outputTemplate": "ui://widget/board",
+          threadId: "session_1",
+          thread: { id: "session_1" },
+          privateWidgetData: { count: 2 },
+        },
+      };
+      const send = (params: Record<string, unknown>) =>
+        backend.dispatchEvent("session_1", {
+          kind: "notification",
+          threadHandle: "session_1",
+          method: "desktop/mcp/event",
+          params: {
+            threadId: "session_1",
+            turnId,
+            server: "codex_apps",
+            tool: "board",
+            arguments: args,
+            ...params,
+          },
+        });
+      send({ phase: "completed", callId: "unknown", result });
+      send({ phase: "started", callId: "wrong-thread", threadId: "unrelated-thread" });
+      send({ phase: "started", callId: "raw-1" });
+      send({ phase: "started", callId: "raw-1" });
+      send({ phase: "completed", callId: "raw-1", result: { content: "not-mcp-content" } });
+      send({ phase: "completed", callId: "raw-1", result, durationMs: 15 });
+      send({ phase: "completed", callId: "raw-1", result });
+      send({ phase: "started", callId: "raw-error" });
+      send({
+        phase: "completed",
+        callId: "raw-error",
+        error: { code: -32000, message: "Upstream failed" },
+        durationMs: 2,
+      });
+      send({ phase: "started", callId: "raw-tool-error" });
+      send({
+        phase: "completed",
+        callId: "raw-tool-error",
+        result: {
+          content: [{ type: "text", text: "tool failed" }],
+          isError: true,
+          _meta: { keep: true },
+        },
+      });
+      await vi.waitFor(() =>
+        expect(
+          outbound.filter(
+            (message) =>
+              message.method === "item/completed" &&
+              JSON.stringify(message).includes('"type":"mcpToolCall"')
+          )
+        ).toHaveLength(3)
+      );
+      const calls = outbound.filter((message) =>
+        JSON.stringify(message).includes('"type":"mcpToolCall"')
+      );
+      expect(calls.map((message) => message.method)).toEqual([
+        "item/started",
+        "item/completed",
+        "item/started",
+        "item/completed",
+        "item/started",
+        "item/completed",
+      ]);
+      expect(calls[0]).toMatchObject({
+        params: {
+          threadId,
+          turnId,
+          startedAtMs: expect.any(Number),
+          item: { id: "raw-1", status: "inProgress", arguments: args },
+        },
+      });
+      expect(calls[1]).toMatchObject({
+        params: {
+          threadId,
+          turnId,
+          completedAtMs: expect.any(Number),
+          item: { result, status: "completed", durationMs: 15, error: null },
+        },
+      });
+      expect(calls[3]).toMatchObject({
+        params: { item: { status: "failed", result: null, error: { message: "Upstream failed" } } },
+      });
+      expect(calls[5]).toMatchObject({
+        params: { item: { status: "failed", result: { isError: true, _meta: { keep: true } } } },
+      });
+      expect(outbound.some((message) => message.method === "desktop/mcp/event")).toBe(false);
+      expect(logger.warn).toHaveBeenCalledTimes(5);
+      backend.sessionHistories.set("session_1", [{ id: "user-1", role: "user", content: "check" }]);
+      const read = (await connection.handleMessage({
+        id: 4,
+        method: "thread/read",
+        params: { threadId, includeTurns: true },
+      })) as { result: { thread: Thread } };
+      expect(read.result.thread.turns[0]?.items).toEqual(
+        expect.arrayContaining([expect.objectContaining({ id: "raw-1", arguments: args, result })])
+      );
+      backend.dispatchEvent("session_1", {
+        kind: "notification",
+        threadHandle: "session_1",
+        method: "turn/completed",
+        params: {
+          threadId: "session_1",
+          turn: { id: turnId, items: [], status: "completed", error: null },
+        },
+      });
+      send({ phase: "started", callId: "late" });
+      await vi.waitFor(() => expect(logger.warn).toHaveBeenCalledTimes(6));
+      const completed = outbound.findLast((message) => message.method === "turn/completed");
+      expect(completed).toMatchObject({
+        params: {
+          threadId,
+          turn: { items: [{ id: "raw-1", result }, { id: "raw-error" }, { id: "raw-tool-error" }] },
+        },
+      });
+      await connection.handleMessage({ id: 5, method: "thread/resume", params: { threadId } });
+      send({ phase: "completed", callId: "raw-1", result });
+      await vi.waitFor(() => expect(logger.warn).toHaveBeenCalledTimes(7));
+      expect(
+        outbound.filter(
+          (message) =>
+            message.method === "item/completed" &&
+            JSON.stringify(message).includes('"type":"mcpToolCall"')
+        )
+      ).toHaveLength(3);
+    } finally {
+      await connection.dispose();
+      await rm(directory, { recursive: true, force: true });
+    }
+  });
+
+  it("rewrites native MCP envelopes without touching opaque tool data", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "codapter-native-mcp-"));
+    const backend = new TestBackend(undefined, { backendType: "codex" });
+    const outbound: Array<Record<string, unknown>> = [];
+    const connection = new AppServerConnection({
+      backend,
+      configStore: new InMemoryConfigStore(join(directory, "adapter.toml")),
+      threadRegistry: new ThreadRegistry(join(directory, "threads.json")),
+      onMessage: (message) => {
+        outbound.push(message as Record<string, unknown>);
+      },
+    });
+    try {
+      await connection.handleMessage({
+        id: 1,
+        method: "initialize",
+        params: {
+          clientInfo: { name: "test", title: null, version: "1" },
+          capabilities: { experimentalApi: true },
+        },
+      });
+      const start = (await connection.handleMessage({
+        id: 2,
+        method: "thread/start",
+        params: {},
+      })) as { result: { thread: { id: string } } };
+      const threadId = start.result.thread.id;
+      const opaque = {
+        threadId: "session_1",
+        thread: { id: "session_1" },
+        nested: { threadId: "session_1" },
+      };
+      const item = {
+        type: "mcpToolCall",
+        id: "native-call",
+        server: "native",
+        tool: "board",
+        status: "completed",
+        arguments: opaque,
+        result: {
+          content: [{ type: "text", text: "done", ...opaque }],
+          structuredContent: opaque,
+          _meta: opaque,
+        },
+        appContext: null,
+        mcpAppUi: null,
+        pluginId: null,
+        readOnlyHint: null,
+        error: null,
+        durationMs: 1,
+      };
+      backend.dispatchEvent("session_1", {
+        kind: "notification",
+        threadHandle: "session_1",
+        method: "item/completed",
+        params: { threadId: "session_1", turnId: "native-turn", item },
+      });
+      backend.dispatchEvent("session_1", {
+        kind: "notification",
+        threadHandle: "session_1",
+        method: "turn/completed",
+        params: {
+          threadId: "session_1",
+          turn: { id: "native-turn", items: [item], status: "completed", error: null },
+        },
+      });
+      await vi.waitFor(() =>
+        expect(outbound.some((message) => message.method === "turn/completed")).toBe(true)
+      );
+      expect(outbound.find((message) => message.method === "item/completed")).toMatchObject({
+        params: { threadId, item },
+      });
+      expect(outbound.find((message) => message.method === "turn/completed")).toMatchObject({
+        params: { threadId, turn: { items: [item] } },
+      });
+      const elicitation = {
+        threadId: "session_1",
+        turnId: "native-turn",
+        serverName: "native",
+        mode: "openai/form",
+        message: "Choose a context",
+        _meta: opaque,
+        requestedSchema: {
+          type: "object",
+          properties: { context: { type: "object", default: opaque, examples: [opaque] } },
+          examples: [opaque],
+        },
+      };
+      backend.dispatchEvent("session_1", {
+        kind: "serverRequest",
+        threadHandle: "session_1",
+        requestId: "native-elicitation",
+        method: "mcpServer/elicitation/request",
+        params: elicitation,
+      });
+      await vi.waitFor(() =>
+        expect(outbound.some((message) => message.method === "mcpServer/elicitation/request")).toBe(
+          true
+        )
+      );
+      const forwarded = outbound.find(
+        (message) => message.method === "mcpServer/elicitation/request"
+      );
+      expect(forwarded).toMatchObject({ params: { ...elicitation, threadId } });
+      expect(forwarded?.id).not.toBe("native-elicitation");
+    } finally {
+      await connection.dispose();
+      await rm(directory, { recursive: true, force: true });
+    }
+  });
+
   it("rejects requests before initialize", async () => {
     const connection = new AppServerConnection();
     const response = await connection.handleMessage({

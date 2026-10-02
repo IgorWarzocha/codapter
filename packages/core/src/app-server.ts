@@ -36,9 +36,16 @@ import type {
   McpServerStatusListResponse,
   ModelListParams,
   ModelListResponse,
+  PluginInstalledParams,
+  PluginInstalledResponse,
+  PluginListParams,
   PluginListResponse,
+  PluginReadParams,
+  PluginReadResponse,
+  SkillsListParams,
   SkillsListResponse,
 } from "./protocol.js";
+import { DynamicToolValidationError, type ThreadDesktopPlugins } from "./thread-desktop.js";
 import { ThreadExecutionSettings } from "./thread-execution.js";
 import { ThreadRegistry, type ThreadRegistryLogger } from "./thread-registry.js";
 import { ThreadSessions } from "./thread-sessions.js";
@@ -69,6 +76,7 @@ export interface AppServerConnectionOptions {
   readonly logger?: AppServerLogger;
   readonly debugLogFilePath?: string | null;
   readonly threadRegistry?: ThreadRegistry;
+  readonly desktopPlugins?: ThreadDesktopPlugins;
   readonly onMessage?: (message: AppServerOutgoingMessage) => void | Promise<void>;
 }
 
@@ -113,6 +121,7 @@ export class AppServerConnection {
   private readonly accountSession: AccountSession;
   private readonly threads: ThreadSessions;
   private readonly serverRequests: BackendServerRequests;
+  private readonly desktopPlugins: ThreadDesktopPlugins | undefined;
   private readonly state: ConnectionState = {
     initialized: false,
     initializedNotificationReceived: false,
@@ -124,6 +133,7 @@ export class AppServerConnection {
       options.backendRouter ??
       (options.backend ? new BackendRouter([options.backend]) : new BackendRouter());
     this.configStore = options.configStore ?? new InMemoryConfigStore();
+    this.desktopPlugins = options.desktopPlugins;
     this.identity = options.identity ?? createIdentity();
     this.logger = options.logger ?? defaultLogger();
     const debugLogFilePath =
@@ -155,6 +165,7 @@ export class AppServerConnection {
       execution: new ThreadExecutionSettings(this.backendRouter, this.configStore),
       serverRequests: this.serverRequests,
       collabEnabled: Boolean(options.collabEnabled),
+      desktopPlugins: options.desktopPlugins,
       logger: this.logger,
       debugLogWriter: this.debugLogWriter,
       publish: (method, params, threadId) => this.publish(method, params, threadId),
@@ -205,7 +216,7 @@ export class AppServerConnection {
 
       switch (request.method) {
         case "config/read":
-          return success(request.id, this.handleConfigRead(request.params));
+          return success(request.id, await this.handleConfigRead(request.params));
         case "config/value/write":
           return success(request.id, this.handleConfigValueWrite(request.params));
         case "config/batchWrite":
@@ -225,9 +236,13 @@ export class AppServerConnection {
         case "getAuthStatus":
           return success(request.id, this.accountSession.authStatus(request.params));
         case "skills/list":
-          return success(request.id, this.handleSkillsList());
+          return success(request.id, await this.handleSkillsList(request.params));
         case "plugin/list":
-          return success(request.id, this.handlePluginList());
+          return success(request.id, await this.handlePluginList(request.params));
+        case "plugin/installed":
+          return success(request.id, await this.handlePluginInstalled(request.params));
+        case "plugin/read":
+          return success(request.id, await this.handlePluginRead(request.params));
         case "app/list":
           return success(request.id, this.handleAppList(request.params));
         case "model/list":
@@ -297,7 +312,9 @@ export class AppServerConnection {
     } catch (error) {
       return failure(
         request.id,
-        JSON_RPC_INTERNAL_ERROR,
+        error instanceof DynamicToolValidationError
+          ? JSON_RPC_INVALID_PARAMS
+          : JSON_RPC_INTERNAL_ERROR,
         error instanceof Error ? error.message : "Internal error"
       );
     }
@@ -429,12 +446,15 @@ export class AppServerConnection {
     };
   }
 
-  private handleConfigRead(params: unknown): ConfigReadResponse {
+  private async handleConfigRead(params: unknown): Promise<ConfigReadResponse> {
     const parsed = (params ?? {}) as Partial<ConfigReadParams>;
-    return this.configStore.read({
+    const readParams = {
       includeLayers: Boolean(parsed.includeLayers),
       cwd: typeof parsed.cwd === "string" ? parsed.cwd : null,
-    });
+    };
+    return this.desktopPlugins?.readConfig
+      ? this.desktopPlugins.readConfig(readParams)
+      : this.configStore.read(readParams);
   }
 
   private handleConfigValueWrite(params: unknown): ConfigWriteResponse {
@@ -449,17 +469,40 @@ export class AppServerConnection {
     return { requirements: null };
   }
 
-  private handleSkillsList(): SkillsListResponse {
-    return { data: [] };
+  private async handleSkillsList(params: unknown): Promise<SkillsListResponse> {
+    return this.desktopPlugins?.skills?.((params ?? {}) as SkillsListParams) ?? { data: [] };
   }
 
-  private handlePluginList(): PluginListResponse {
+  private async handlePluginList(params: unknown): Promise<PluginListResponse> {
+    if (this.desktopPlugins?.list)
+      return this.desktopPlugins.list((params ?? {}) as PluginListParams);
     return {
       marketplaces: [],
       marketplaceLoadErrors: [],
       featuredPluginIds: [],
       remoteSyncError: null,
     };
+  }
+
+  private async handlePluginInstalled(params: unknown): Promise<PluginInstalledResponse> {
+    return (
+      this.desktopPlugins?.installed?.((params ?? {}) as PluginInstalledParams) ?? {
+        marketplaces: [],
+        marketplaceLoadErrors: [],
+      }
+    );
+  }
+
+  private async handlePluginRead(params: unknown): Promise<PluginReadResponse> {
+    const parsed = params as Partial<PluginReadParams> | null;
+    if (!parsed || typeof parsed.pluginName !== "string" || !parsed.pluginName.trim())
+      throw new DynamicToolValidationError("plugin/read requires pluginName");
+    for (const key of ["marketplacePath", "remoteMarketplaceName"] as const) {
+      if (parsed[key] !== undefined && parsed[key] !== null && typeof parsed[key] !== "string")
+        throw new DynamicToolValidationError(`Invalid plugin/read ${key}`);
+    }
+    if (!this.desktopPlugins?.read) throw new Error("Desktop plugin catalogue is unavailable");
+    return this.desktopPlugins.read(parsed as PluginReadParams);
   }
 
   private handleAppList(_params: unknown): AppListResponse {

@@ -264,6 +264,24 @@ export type PluginListResponse = {
   remoteSyncError: string | null;
 };
 
+export type PluginInstalledParams = {
+  cwds?: string[] | null;
+  installSuggestionPluginNames?: string[] | null;
+};
+
+export type PluginInstalledResponse = Pick<
+  PluginListResponse,
+  "marketplaces" | "marketplaceLoadErrors"
+>;
+
+export type PluginReadParams = {
+  marketplacePath?: string | null;
+  remoteMarketplaceName?: string | null;
+  pluginName: string;
+};
+
+export type PluginReadResponse = { plugin: JsonValue };
+
 export type AppListParams = {
   cursor?: string | null;
   limit?: number | null;
@@ -382,6 +400,34 @@ export type UserInput =
   | { type: "skill"; name: string; path: string }
   | { type: "mention"; name: string; path: string };
 
+export type McpToolCallItem = {
+  type: "mcpToolCall";
+  id: string;
+  server: string;
+  tool: string;
+  status: "inProgress" | "completed" | "failed";
+  arguments: JsonValue;
+  appContext: {
+    connectorId: string;
+    linkId: string | null;
+    resourceUri: string | null;
+    appName: string | null;
+    actionName: string | null;
+  } | null;
+  mcpAppResourceUri?: string;
+  mcpAppUi: { resourceUri: string; preferredModelDisplayMode: "inline" | "fullscreen" } | null;
+  pluginId: string | null;
+  readOnlyHint: boolean | null;
+  result: {
+    content: JsonValue[];
+    structuredContent: JsonValue | null;
+    _meta: JsonValue | null;
+    [key: string]: JsonValue | undefined;
+  } | null;
+  error: { message: string } | null;
+  durationMs: number | null;
+};
+
 export type ThreadItem =
   | { type: "userMessage"; id: string; content: JsonValue[] }
   | { type: "agentMessage"; id: string; text: string; phase: string | null }
@@ -399,6 +445,7 @@ export type ThreadItem =
       durationMs: number | null;
     }
   | { type: "fileChange"; id: string; changes: JsonValue[]; status: string }
+  | McpToolCallItem
   | CollabAgentToolCallItem;
 
 export type TurnStatus = "completed" | "interrupted" | "failed" | "inProgress";
@@ -425,6 +472,7 @@ export type Turn = {
 
 export type TurnStartParams = {
   threadId: string;
+  disabledPluginIds?: string[] | null;
   input: UserInput[];
   cwd?: string | null;
   approvalPolicy?: string | null;
@@ -507,10 +555,30 @@ export type ThreadStartParams = {
   baseInstructions?: string | null;
   developerInstructions?: string | null;
   personality?: string | null;
+  dynamicTools?: DynamicToolSpec[] | null;
   ephemeral?: boolean | null;
   experimentalRawEvents: boolean;
   persistExtendedHistory: boolean;
 };
+
+export type DynamicToolFunctionSpec = {
+  name: string;
+  description: string;
+  inputSchema: JsonValue;
+  deferLoading?: boolean;
+};
+
+export type DynamicToolNamespaceTool = { type: "function" } & DynamicToolFunctionSpec;
+
+export type DynamicToolNamespaceSpec = {
+  name: string;
+  description: string;
+  tools: DynamicToolNamespaceTool[];
+};
+
+export type DynamicToolSpec =
+  | DynamicToolNamespaceTool
+  | ({ type: "namespace" } & DynamicToolNamespaceSpec);
 
 export type ThreadStartResponse = {
   thread: Thread;

@@ -82,7 +82,9 @@ describe("backend configuration", () => {
           },
         })
       ).toEqual({ exitCode: 0 });
-      expect(piBackend.factory).toHaveBeenCalledWith({ idleTimeoutMs: Number(value), args: [] });
+      expect(piBackend.factory).toHaveBeenCalledWith(
+        expect.objectContaining({ idleTimeoutMs: Number(value), args: [] })
+      );
       expect(codexBackend.factory).toHaveBeenCalledWith(expect.objectContaining({ args: [] }));
     }
   );
@@ -90,21 +92,29 @@ describe("backend configuration", () => {
   it.each([
     ["-c", "features.code_mode_host=true", "app-server", "--analytics-default-enabled"],
     ["app-server", "-c", "features.code_mode_host=true", "--analytics-default-enabled"],
-  ])("accepts real desktop invocation %j and forwards config only to Codex", async (...args) => {
-    const piBackend = mockPi();
-    const codexBackend = mockCodex();
-    const io = streams();
-    expect(await runCli(args, { ...io, env: {} })).toEqual({ exitCode: 0 });
-    expect(piBackend.factory).toHaveBeenCalledWith({});
-    expect(codexBackend.factory).toHaveBeenCalledWith(
-      expect.objectContaining({
-        args: ["-c", "features.code_mode_host=true", "app-server"],
-      })
-    );
-    expect(io.errors()).toContain(
-      "Ignoring Codex config overrides for Pi: features.code_mode_host"
-    );
-  });
+  ])(
+    "accepts real desktop invocation %j without ignoring desktop overrides for Pi",
+    async (...args) => {
+      const piBackend = mockPi();
+      const codexBackend = mockCodex();
+      const io = streams();
+      expect(await runCli(args, { ...io, env: {} })).toEqual({ exitCode: 0 });
+      expect(piBackend.factory).toHaveBeenCalledWith(
+        expect.objectContaining({
+          desktopExtensionPath: expect.stringContaining(
+            "/backend-pi/dist/desktop-extension/index.js"
+          ),
+          desktopMcpProxyPath: expect.stringContaining("/backend-pi/dist/desktop-mcp-proxy.js"),
+        })
+      );
+      expect(codexBackend.factory).toHaveBeenCalledWith(
+        expect.objectContaining({
+          args: ["-c", "features.code_mode_host=true", "app-server"],
+        })
+      );
+      expect(io.errors()).toBe("");
+    }
+  );
 
   it.each([
     "missing-separator",
@@ -114,6 +124,9 @@ describe("backend configuration", () => {
     "features.code_mode_host= ",
     "features.code_mode_host=private-token\0",
     "features\nsecret=private-token",
+    'plugins."unterminated.enabled=private-token',
+    'plugins."bad\\q".enabled=private-token',
+    'plugins."__proto__".enabled=private-token',
     "--config",
   ])("rejects malformed config %j visibly without leaking values", async (value) => {
     const backend = mockPi();
@@ -155,15 +168,23 @@ describe("backend configuration", () => {
         env: { CODAPTER_CODEX_ARGS: '["app-server","--listen","stdio"]' },
       })
     ).toEqual({ exitCode: 0 });
-    expect(piBackend.factory).toHaveBeenCalledWith({});
+    expect(piBackend.factory).toHaveBeenCalledWith(
+      expect.objectContaining({
+        desktopExtensionPath: expect.stringContaining(
+          "/backend-pi/dist/desktop-extension/index.js"
+        ),
+        desktopMcpProxyPath: expect.stringContaining("/backend-pi/dist/desktop-mcp-proxy.js"),
+      })
+    );
     expect(codexBackend.factory).toHaveBeenCalledWith(
       expect.objectContaining({
         args: [...overrides.flatMap((value) => ["-c", value]), "app-server", "--listen", "stdio"],
       })
     );
-    for (const override of overrides) {
-      expect(io.errors()).toContain(override.slice(0, override.indexOf("=")));
-    }
+    expect(io.errors()).toContain("Ignoring Codex config overrides for Pi: chatgpt_base_url.");
+    expect(io.errors()).not.toContain("plugins.");
+    expect(io.errors()).not.toContain("mcp_servers.");
+    expect(io.errors()).not.toContain("features.");
     expect(io.errors()).toContain("Pi extensions remain authoritative");
     expect(io.errors()).not.toContain("private-url-token");
     expect(io.errors()).not.toContain("private-header-token");
@@ -183,6 +204,27 @@ describe("backend configuration", () => {
     expect(backend.factory).toHaveBeenCalledWith(
       expect.objectContaining({ args: ["-c", argument, "app-server"] })
     );
+  });
+
+  it("starts Codex-only with native unquoted desktop CLI strings and forwards original arguments", async () => {
+    const native = mockCodex();
+    const piBackend = mockPi();
+    const io = streams();
+    const overrides = [" mcp_servers.demo.command = node ", "apps_mcp_product_sku=codex"];
+    expect(
+      await runCli(["-c", overrides[0], "app-server", "--config", overrides[1]], {
+        ...io,
+        env: { CODAPTER_PI_DISABLE: "1" },
+      })
+    ).toEqual({ exitCode: 0 });
+    expect(native.initialize).toHaveBeenCalledOnce();
+    expect(native.factory).toHaveBeenCalledWith(
+      expect.objectContaining({
+        args: [...overrides.flatMap((argument) => ["-c", argument]), "app-server"],
+      })
+    );
+    expect(piBackend.factory).not.toHaveBeenCalled();
+    expect(io.errors()).toBe("");
   });
 });
 

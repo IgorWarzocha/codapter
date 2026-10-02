@@ -19,6 +19,7 @@ import type {
   BackendTurnInterruptInput,
   BackendTurnStartInput,
   BackendTurnStartResult,
+  DesktopSessionCapabilities,
   Disposable,
   IBackend,
 } from "@codapter/core";
@@ -216,8 +217,14 @@ export class PiBackend implements IBackend {
   getSessionPath(handle: string) {
     return this.runtime.getSessionPath(handle);
   }
-  prompt(handle: string, turnId: string, text: string, images?: readonly BackendImageInput[]) {
-    return this.runtime.prompt(handle, turnId, text, images);
+  prompt(
+    handle: string,
+    turnId: string,
+    text: string,
+    images?: readonly BackendImageInput[],
+    capabilities?: DesktopSessionCapabilities
+  ) {
+    return this.runtime.prompt(handle, turnId, text, images, capabilities);
   }
   abort(handle: string) {
     return this.runtime.abort(handle);

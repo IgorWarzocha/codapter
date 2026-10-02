@@ -3,6 +3,7 @@ import type { BackendRouter, RoutedBackendSelection } from "./backend-router.js"
 import type { InMemoryConfigStore } from "./config-store.js";
 import type {
   ConfigReadResponse,
+  DynamicToolSpec,
   JsonValue,
   SandboxMode,
   SandboxPolicy,
@@ -29,6 +30,8 @@ export interface ThreadExecutionContext {
   readonly personality: string | null;
   readonly summary: string | null;
   readonly collaborationMode: JsonValue | null;
+  readonly dynamicTools?: readonly DynamicToolSpec[];
+  readonly browserOverridesKnown?: boolean;
 }
 
 function readStringRecordValue(record: unknown, key: string): string | null {
@@ -126,6 +129,15 @@ export class ThreadExecutionSettings {
     return this.configStore.read({ includeLayers: false, cwd }).config;
   }
 
+  readDesktopConfig(
+    cwd: string,
+    overrides: Record<string, JsonValue | undefined> | null
+  ): Record<string, JsonValue | undefined> {
+    const effective: Record<string, JsonValue | undefined> = { ...this.readEffectiveConfig(cwd) };
+    if (effective.browser_use === null) delete effective.browser_use;
+    return structuredClone({ ...effective, ...overrides });
+  }
+
   resolveRequestedModel(
     cwd: string | null,
     requestedModel: string | null | undefined,
@@ -193,7 +205,8 @@ export class ThreadExecutionSettings {
     requestedApprovalPolicy: string | null,
     requestedApprovalsReviewer: string | null,
     requestedSandboxMode: SandboxMode | null,
-    requestedReasoningEffort: string | null
+    requestedReasoningEffort: string | null,
+    disabledPluginIds: readonly string[] = []
   ): Promise<ThreadStartResponse> {
     const models = await this.backendRouter.listModels();
     const defaultModel = models.find((model) => model.isDefault) ?? models[0];
@@ -204,7 +217,7 @@ export class ThreadExecutionSettings {
       model: requestedModel ?? persistedModel ?? defaultModel?.model ?? "unknown::default",
       modelProvider: thread.modelProvider,
       serviceTier: this.threadExecutionContexts.get(thread.id)?.serviceTier ?? null,
-      disabledPluginIds: [],
+      disabledPluginIds: [...disabledPluginIds],
       instructionSources: [],
       cwd,
       approvalPolicy: requestedApprovalPolicy ?? DEFAULT_APPROVAL_POLICY,

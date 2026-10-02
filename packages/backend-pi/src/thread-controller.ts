@@ -141,6 +141,7 @@ export class PiThreadController {
     });
     runtime.machine = machine;
     try {
+      session.prepareDesktopTurn(input.threadId, input.turnId, input.desktopCapabilities);
       if (input.model) await this.sessions.setModel(input.threadHandle, input.model);
       if (input.reasoningEffort)
         await this.sessions.setThinkingLevel(input.threadHandle, input.reasoningEffort);
@@ -156,10 +157,12 @@ export class PiThreadController {
         input.threadHandle,
         input.turnId,
         normalized.text,
-        normalized.images
+        normalized.images,
+        input.desktopCapabilities
       );
       return { accepted: true, turnId: input.turnId };
     } catch (error) {
+      session.cancelDesktopTurn(input.turnId, "Desktop turn failed");
       await runtime.eventQueue;
       if (runtime.machine === machine) {
         await machine.handleEvent({
@@ -199,6 +202,16 @@ export class PiThreadController {
   }
 
   async resolveServerRequest(input: BackendResolveServerRequestInput): Promise<void> {
+    if (String(input.requestId).startsWith("desktop_")) {
+      if (
+        !this.getProcess(input.threadHandle)?.resolveDesktopRequest(
+          String(input.requestId),
+          input.response
+        )
+      )
+        throw new Error("Unknown or cancelled Desktop tool request");
+      return;
+    }
     const runtime = this.threadRuntimes.get(input.threadHandle);
     const payload = runtime?.pendingElicitationPayloads.get(String(input.requestId));
     await this.sessions.respondToElicitation(
@@ -275,6 +288,63 @@ export class PiThreadController {
         code: "PI_EXTENSION_ERROR",
         message: event.message,
         retryable: false,
+      });
+      return;
+    }
+
+    if (event.type === "desktop_tool_call") {
+      if (
+        !runtime.machine ||
+        runtime.activeTurnId !== event.turnId ||
+        !this.getProcess(threadHandle)?.hasPendingDesktopRequest(event.requestId)
+      )
+        return;
+      this.eventBuffer.emit(threadHandle, {
+        kind: "serverRequest",
+        threadHandle,
+        requestId: event.requestId,
+        method: "item/tool/call",
+        params: {
+          threadId: event.threadId,
+          turnId: event.turnId,
+          callId: event.callId,
+          namespace: event.namespace,
+          tool: event.tool,
+          arguments: event.arguments,
+        },
+      });
+      return;
+    }
+
+    if (event.type === "desktop_mcp_elicitation_request") {
+      if (
+        !runtime.machine ||
+        runtime.activeTurnId !== event.turnId ||
+        !this.getProcess(threadHandle)?.hasPendingDesktopRequest(event.requestId)
+      )
+        return;
+      this.eventBuffer.emit(threadHandle, {
+        kind: "serverRequest",
+        threadHandle,
+        requestId: event.requestId,
+        method: "mcpServer/elicitation/request",
+        params: {
+          ...event.request,
+          threadId: event.threadId,
+          turnId: event.turnId,
+          serverName: event.serverName,
+        },
+      });
+      return;
+    }
+
+    if (event.type === "desktop_mcp_event") {
+      const { type: _type, ...params } = event;
+      this.eventBuffer.emit(threadHandle, {
+        kind: "notification",
+        threadHandle,
+        method: "desktop/mcp/event",
+        params,
       });
       return;
     }

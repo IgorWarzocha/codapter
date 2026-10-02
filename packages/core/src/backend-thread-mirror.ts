@@ -45,7 +45,21 @@ export class BackendThreadMirror {
 
     const rewritten: Record<string, unknown> = {};
     for (const [key, entry] of Object.entries(value)) {
-      rewritten[key] = this.rewriteBackendThreadReferences(threadId, threadHandle, entry);
+      // Tool payloads are application data, not protocol thread references.
+      rewritten[key] = [
+        "arguments",
+        "result",
+        "structuredContent",
+        "content",
+        "_meta",
+        "input",
+        "output",
+        "requestedSchema",
+        "inputSchema",
+        "outputSchema",
+      ].includes(key)
+        ? entry
+        : this.rewriteBackendThreadReferences(threadId, threadHandle, entry);
     }
 
     if (rewritten.threadId === threadHandle) {

@@ -311,6 +311,15 @@ describe("CodexBackend", () => {
       personality: "friendly",
       experimentalRawEvents: true,
       persistExtendedHistory: true,
+      dynamicTools: [
+        {
+          type: "function",
+          name: "read_view",
+          description: "Read view",
+          inputSchema: { type: "object" },
+          deferLoading: false,
+        },
+      ],
       launchConfig: {},
     });
 
@@ -336,6 +345,7 @@ describe("CodexBackend", () => {
       collaborationMode: {
         mode: "default",
       },
+      disabledPluginIds: ["browser@openai-bundled"],
     });
 
     const requests = (await readFile(requestsPath, "utf8"))
@@ -362,6 +372,15 @@ describe("CodexBackend", () => {
       personality: "friendly",
       experimentalRawEvents: true,
       persistExtendedHistory: true,
+      dynamicTools: [
+        {
+          type: "function",
+          name: "read_view",
+          description: "Read view",
+          inputSchema: { type: "object" },
+          deferLoading: false,
+        },
+      ],
     });
     expect(turnStartRequest?.params).toMatchObject({
       approvalPolicy: "on-request",
@@ -379,6 +398,7 @@ describe("CodexBackend", () => {
       collaborationMode: {
         mode: "default",
       },
+      disabledPluginIds: ["browser@openai-bundled"],
     });
 
     await backend.dispose();

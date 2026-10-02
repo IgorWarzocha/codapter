@@ -1,7 +1,12 @@
 import { randomUUID } from "node:crypto";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import type { BackendRouter, StoredAuthState } from "@codapter/core";
+import type {
+  AppServerConnectionOptions,
+  BackendRouter,
+  InMemoryConfigStore,
+  StoredAuthState,
+} from "@codapter/core";
 import { startStdioListener } from "./stdio.js";
 import { startTcpListener, startUnixListener } from "./websocket.js";
 
@@ -18,6 +23,8 @@ export interface ListenerSet {
 
 export interface ListenerOptions {
   readonly backendRouter: BackendRouter;
+  readonly configStore?: InMemoryConfigStore;
+  readonly desktopPlugins?: AppServerConnectionOptions["desktopPlugins"];
   readonly stdin?: NodeJS.ReadableStream;
   readonly stdout?: NodeJS.WritableStream;
   readonly collabEnabled?: boolean;

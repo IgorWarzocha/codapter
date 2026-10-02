@@ -1,6 +1,7 @@
 import { randomUUID } from "node:crypto";
 import type { BackendRouter } from "./backend-router.js";
 import type { CollabManager } from "./collab-manager.js";
+import { resumeBrowserConfig } from "./desktop-browser-policy.js";
 import type {
   TurnInterruptParams,
   TurnInterruptResponse,
@@ -9,6 +10,7 @@ import type {
   UserInput,
 } from "./protocol.js";
 import { isInternalTitlePrompt } from "./thread-catalog.js";
+import { normalizeDisabledPluginIds, type ThreadDesktop } from "./thread-desktop.js";
 import {
   buildSandboxPolicy,
   DEFAULT_APPROVAL_POLICY,
@@ -31,7 +33,8 @@ export class ThreadTurns {
     private readonly threadRegistry: ThreadRegistry,
     private readonly execution: ThreadExecutionSettings,
     private readonly collabManager: CollabManager | null,
-    private readonly runtimeForThread: (threadId: string) => ThreadRuntime | undefined
+    private readonly runtimeForThread: (threadId: string) => ThreadRuntime | undefined,
+    private readonly desktop: ThreadDesktop
   ) {}
   async start(params: unknown): Promise<TurnStartResponse> {
     const parsed = params as TurnStartParams;
@@ -39,6 +42,10 @@ export class ThreadTurns {
     if (!runtime) throw new Error(`Thread ${parsed.threadId} is not loaded`);
     await runtime.requireReady();
     let entry = await this.getThreadEntry(parsed.threadId);
+    const disabledPluginIds =
+      parsed.disabledPluginIds == null
+        ? (entry.disabledPluginIds ?? [])
+        : normalizeDisabledPluginIds(parsed.disabledPluginIds);
     const { text, preview } = this.normalizeUserInputs(parsed.input);
     const backend = this.backendRouter.requireBackend(entry.backendType);
     const effectiveModel = this.execution.resolveRequestedModel(
@@ -66,7 +73,9 @@ export class ThreadTurns {
       cwd?: string | null;
       model?: string | null;
       reasoningEffort?: string | null;
+      disabledPluginIds?: readonly string[];
     } = {};
+    if (parsed.disabledPluginIds != null) threadPatch.disabledPluginIds = disabledPluginIds;
     if (!entry.preview && preview) {
       if (isInternalTitlePrompt(text)) {
         threadPatch.hidden = true;
@@ -89,6 +98,8 @@ export class ThreadTurns {
     }
 
     const existingExecutionContext = this.execution.cloneThreadExecutionContext(parsed.threadId);
+    const threadConfig =
+      existingExecutionContext?.config ?? resumeBrowserConfig(entry.browserOverrides, null);
     this.execution.recordThreadExecutionContext(parsed.threadId, {
       cwd: parsed.cwd ?? entry.cwd ?? process.cwd(),
       model: entry.model,
@@ -108,7 +119,7 @@ export class ThreadTurns {
           existingExecutionContext?.sandbox ?? null,
           parsed.cwd ?? entry.cwd ?? process.cwd()
         ),
-      config: existingExecutionContext?.config ?? null,
+      config: threadConfig,
       reasoningEffort: entry.reasoningEffort,
       serviceTier: parsed.serviceTier ?? existingExecutionContext?.serviceTier ?? null,
       serviceName: existingExecutionContext?.serviceName ?? null,
@@ -118,7 +129,25 @@ export class ThreadTurns {
       summary: parsed.summary ?? existingExecutionContext?.summary ?? null,
       collaborationMode:
         parsed.collaborationMode ?? existingExecutionContext?.collaborationMode ?? null,
+      dynamicTools: entry.dynamicTools ?? [],
+      browserOverridesKnown: entry.browserOverrides != null,
     });
+
+    const cwd = parsed.cwd ?? entry.cwd ?? process.cwd();
+    const desktopCapabilities =
+      entry.backendType === "pi"
+        ? await this.desktop.capabilities(
+            cwd,
+            threadConfig,
+            entry.dynamicTools ?? [],
+            disabledPluginIds,
+            entry.browserOverrides != null
+          )
+        : undefined;
+    const input =
+      entry.backendType === "pi"
+        ? await this.desktop.expandInput(parsed.input, cwd, threadConfig, disabledPluginIds)
+        : parsed.input;
 
     const turnId = randomUUID();
     runtime.beginTurn(turnId);
@@ -142,7 +171,9 @@ export class ThreadTurns {
         threadHandle: runtime.threadHandle,
         turnId,
         cwd: parsed.cwd ?? entry.cwd ?? process.cwd(),
-        input: parsed.input,
+        input,
+        ...(parsed.disabledPluginIds != null ? { disabledPluginIds } : {}),
+        ...(desktopCapabilities ? { desktopCapabilities } : {}),
         model: requestedSelection?.selection.rawModelId ?? null,
         reasoningEffort: effectiveReasoningEffort,
         approvalPolicy: parsed.approvalPolicy ?? null,

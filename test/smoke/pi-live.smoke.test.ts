@@ -9,8 +9,10 @@ import { fileURLToPath } from "node:url";
 import { describe, expect, it } from "vitest";
 import {
   isJsonRpcNotification,
+  isJsonRpcRequest,
   isJsonRpcResponse,
   type JsonRpcNotification,
+  type JsonRpcRequest,
 } from "../../packages/core/src/jsonrpc.js";
 import type {
   ModelListResponse,
@@ -28,7 +30,7 @@ const BUNDLE = fileURLToPath(new URL("../../dist/codapter.mjs", import.meta.url)
 
 // Real process boundary, not a provider double. HOME stays intact so Pi loads the
 // installed wrapper, authentication, extensions, and prompts unchanged.
-function startClient(directory: string) {
+function startClient(directory: string, onServerRequest?: (request: JsonRpcRequest) => unknown) {
   const piArgs: unknown = JSON.parse(process.env.CODAPTER_PI_ARGS ?? '["--mode","rpc"]');
   if (!Array.isArray(piArgs) || !piArgs.every((arg) => typeof arg === "string")) {
     throw new Error("CODAPTER_PI_ARGS must be a JSON array of strings");
@@ -88,6 +90,9 @@ function startClient(directory: string) {
         pending.delete(message.id);
         if ("error" in message) request?.reject(new Error(message.error.message));
         else request?.resolve(message.result);
+      } else if (isJsonRpcRequest(message) && onServerRequest) {
+        const result = onServerRequest(message);
+        child.stdin.write(`${JSON.stringify({ id: message.id, result })}\n`);
       } else {
         fail(new Error(`Unexpected live RPC message: ${line}`));
       }
@@ -134,6 +139,106 @@ async function initialize(client: ReturnType<typeof startClient>) {
 }
 
 describe.skipIf(process.env.PI_LIVE_TEST !== "1")("installed Pi with Luna 6 low", () => {
+  it("calls a GUI-supplied tool through native Pi before and after a cold resume", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "codapter-live-desktop-"));
+    const markers: string[] = [];
+    const calls: unknown[] = [];
+    const answer = (request: JsonRpcRequest) => {
+      expect(request.method).toBe("item/tool/call");
+      calls.push(request.params);
+      const marker = `desktop-${randomUUID()}`;
+      markers.push(marker);
+      return { success: true, contentItems: [{ type: "inputText", text: marker }] };
+    };
+    let client = startClient(directory, answer);
+    const config = {
+      model_reasoning_effort: "low",
+      features: { apps: false },
+      mcp_servers: { node_repl: { enabled: false } },
+    };
+    try {
+      await initialize(client);
+      const started = await client.request<ThreadStartResponse>("thread/start", {
+        model: MODEL,
+        cwd: directory,
+        config,
+        dynamicTools: [
+          {
+            type: "function",
+            name: "desktop_token",
+            description: "Get a fresh test token held by the Desktop client",
+            inputSchema: { type: "object", properties: {}, additionalProperties: false },
+            deferLoading: false,
+          },
+        ],
+      });
+      for (let index = 0; index < 2; index++) {
+        if (index) {
+          await client.close();
+          client = startClient(directory, answer);
+          await initialize(client);
+          await client.request("thread/resume", {
+            threadId: started.thread.id,
+            model: MODEL,
+            config,
+          });
+        }
+        const turn = await client.request<TurnStartResponse>("turn/start", {
+          threadId: started.thread.id,
+          model: MODEL,
+          effort: "low",
+          input: [
+            {
+              type: "text",
+              text: "Call the Desktop test token tool to get a fresh token, then reply with its exact text. Do not reuse a previous token, run commands, read files, use the web, or delegate.",
+              text_elements: [],
+            },
+          ],
+        });
+        await expect
+          .poll(
+            () =>
+              client.notifications.find(
+                (event) =>
+                  event.method === "turn/completed" &&
+                  (event.params as { turn?: { id?: string } }).turn?.id === turn.turn.id
+              ),
+            { timeout: 150_000, interval: 100 }
+          )
+          .toMatchObject({ params: { turn: { status: "completed", error: null } } });
+        expect(calls.length).toBe(index + 1);
+        expect(calls[index]).toMatchObject({
+          threadId: started.thread.id,
+          turnId: turn.turn.id,
+          namespace: null,
+          tool: "desktop_token",
+          arguments: {},
+        });
+        const history = await client.request<ThreadReadResponse>("thread/read", {
+          threadId: started.thread.id,
+          includeTurns: true,
+        });
+        expect(
+          history.thread.turns
+            .flatMap((entry) => entry.items)
+            .filter((item) => item.type === "agentMessage")
+            .map((item) => item.text)
+            .join("\n")
+        ).toContain(markers[index]);
+        const session = await readFile(history.thread.path as string, "utf8");
+        expect(session).toContain('"modelId":"gpt-6-luna"');
+        expect(session).toContain('"thinkingLevel":"low"');
+      }
+      await client.request("thread/archive", { threadId: started.thread.id });
+    } finally {
+      try {
+        await client.close();
+      } finally {
+        await rm(directory, { recursive: true, force: true });
+      }
+    }
+  }, 360_000);
+
   it("runs extension tools and preserves a thread across fork and process restart", async () => {
     const directory = await mkdtemp(join(tmpdir(), "codapter-live-"));
     const marker = `codapter-${randomUUID()}`;

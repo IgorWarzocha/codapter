@@ -30,14 +30,14 @@ Status:
 
 | Codex concept | Current codapter mapping | Notes |
 | --- | --- | --- |
-| `config/read` | `InMemoryConfigStore.read()` via `AppServerConnection` | Returns the typed `{ config, origins, layers }` shape. All writes are persisted to `~/.config/codapter/config.toml`. |
+| `config/read` | Shared `DesktopPluginCatalog.readConfig()` and adapter settings | Returns `{ config, origins, layers }`. Desktop tables combine native settings, CLI overrides, and adapter settings without importing native model defaults. Writes go only to `~/.config/codapter/config.toml`. |
 | `config/value/write` | `InMemoryConfigStore.writeValue()` | Returns typed `ConfigWriteResponse`. |
 | `config/batchWrite` | `InMemoryConfigStore.writeBatch()` | Returns typed `ConfigWriteResponse`. |
 | `configRequirements/read` | `AppServerConnection.handleConfigRequirementsRead()` | Returns `{ requirements: null }`. |
 | `account/read` | `AccountSession.read()` in `packages/core/src/account-session.ts` | Uses adapter identity and backend auth state. |
 | `getAuthStatus` | `AccountSession.authStatus()` | Supported for compatibility. |
-| `skills/list` | `AppServerConnection.handleSkillsList()` | Empty GUI inventory. Native Pi skill loading is unchanged. |
-| `plugin/list` | `AppServerConnection.handlePluginList()` | Empty GUI inventory with current marketplace error and featured-plugin fields. Pi extension loading is unchanged. |
+| `skills/list` | `DesktopPluginCatalog.skills()` | Local plugin skills and their enablement. Native Pi skill loading is independent. |
+| `plugin/list`, `plugin/installed`, `plugin/read` | Shared `DesktopPluginCatalog` | Configured local marketplaces and materialized packages, with explicit load errors. No remote installer or authentication store is recreated. |
 | Adapter identity | `packages/core/src/app-server-identity.ts` | Derived from env/TOML override or `codapter/<ADAPTER_VERSION>` from `version.ts`, with platform detection. |
 
 ## Threads
@@ -76,8 +76,8 @@ Status:
 | `UserInput.type: "text"` | Concatenated into prompt text | Text inputs are joined in order. |
 | `UserInput.type: "image"` | Passed through as backend image input | `url` is mapped to the backend image input contract. |
 | `UserInput.type: "localImage"` | Passed through as backend image input | `path` is mapped to the backend image input contract. |
-| `UserInput.type: "skill"` | Passed to the backend | Pi rejects the desktop attachment variant. Native Pi skills still load normally. |
-| `UserInput.type: "mention"` | Passed to the backend | Pi rejects the desktop attachment variant. Native prompt and extension handling remains unchanged. |
+| `UserInput.type: "skill"` | Known enabled plugin skill expanded by the catalog | Only catalog-owned skill paths are loaded. Native Pi skills remain independent. |
+| `UserInput.type: "mention"` | Known enabled plugin mention expanded by the catalog | Selected plugin guidance becomes prompt input. Unknown attachment variants remain explicit backend errors. |
 | `UserInput.type: "audio"` or `"localAudio"` | Backend-owned support | Pi rejects unsupported audio explicitly. |
 | Image containing only a Codex `fileId` | Backend-owned support | Pi requires image data or a local path and rejects file-ID-only input. |
 
@@ -130,13 +130,32 @@ Behavior notes:
 | Server-request relay | Upstream JSON-RPC request/response mapping | Request ids are tracked and resolved through adapter relay. |
 | WebSocket transport | Explicit unsupported error | Only the native backend proxy lacks WebSocket support, not client listeners. |
 
+## Desktop capabilities
+
+The CLI shares one local plugin catalog and adapter config store across connections. Native desktop settings are the base. CLI overrides, adapter settings, and thread overrides take precedence in that order. Only desktop capability tables enter Pi launch configuration. Quoted TOML keys and native dotted thread overrides retain their original meaning.
+
+- `thread/start.dynamicTools` registers session-local Pi tools. Calls use the original namespace and tool name in `item/tool/call`, with connection-local response correlation, cancellation, and rich results.
+- Enabled local plugin skills are listed by path. Selecting a known plugin or skill expands its guidance. Definitions and enablement survive resume without persisting MCP credentials.
+- Ordinary MCP servers use native Pi registration. Exact tool filters are translated to Pi exposure rules. Unsupported approval, environment, or remote-execution policies fail closed with diagnostics.
+- ChatGPT apps use native Pi provider authentication and a loopback relay to the fixed ChatGPT MCP endpoint. Connector and tool denials are enforced against the upstream catalog, not guessed name prefixes. Authentication is not copied into adapter files.
+- The packaged Browser host receives the real GUI thread and turn IDs. Its stop and interrupt hooks run at the corresponding native Pi lifecycle boundaries. Ordinary Browser consent requests reach `mcpServer/elicitation/request`, not automatic approval. Requests requiring strict Guardian auto-review are rejected because manual consent is not a substitute for that review.
+- Raw MCP result metadata reaches live `mcpToolCall` items for desktop rendering. Current-runtime history retains those items. Cold native Pi history can lose rich widget metadata. Tool-catalog widget resources and complete MCP app UI hosting are not implemented, so raw metadata preservation does not guarantee every app widget renders.
+
+Plugin installation, remote marketplace synchronization, and the desktop MCP management UI are not implemented. Desktop sandbox labels still do not restrict arbitrary native Pi tools.
+
+Browser authentication and policy reads use a private helper bound to the Pi session. The helper reads current authentication through Pi's provider API. It does not start a native Codex app-server, log tokens, or expose arbitrary host RPCs. The shipped Codex binary is still used for Desktop's native JavaScript sandbox, with its original policy.
+
+Browser policy checks currently support known account plans that do not require cloud-managed Codex policy. Device-managed requirements, macOS MDM verification, unknown account plans, and Browser policies in unsupported system, project, or profile layers fail closed. The helper reports no managed requirements only after verifying that supported sources are absent. User and thread `browser_use` and `application` settings are preserved. This is not an enterprise policy loader.
+
+Sanitized thread Browser restrictions survive cold resume. Native base settings are read again rather than saved as stale defaults. Older thread records without that policy information cannot use Browser until a client explicitly resupplies the complete Browser policy or starts a new thread. Other thread-only MCP configuration and credentials are not persisted and must be supplied again when needed.
+
 ## Unsupported Or Partially Implemented Areas
 
 | Codex concept | Current state | Notes |
 | --- | --- | --- |
 | Worktree RPCs (`create-worktree`, `delete-worktree`, `resolve-worktree-for-thread`, `worktree-cleanup-inputs`) | Not implemented | They currently return `Method not found`. |
-| Elicitation server requests (`item/tool/requestUserInput`, `mcpServer/elicitation/request`) | Pi-backed elicitation implemented | `item/tool/requestUserInput` is wired as a server-request round-trip; MCP server elicitation is unsupported. |
-| GUI-provided `dynamicTools` and `item/tool/call` | Not bridged into Pi | Plugin prompt text can arrive as ordinary input, but plugin tool declarations and call results do not become Pi tools. |
+| Elicitation server requests (`item/tool/requestUserInput`, `mcpServer/elicitation/request`) | GUI round-trips | Native Pi dialogs and bridged MCP permission requests preserve answers, errors, and cancellation. Custom TUI screens remain unsupported. |
+| GUI-provided `dynamicTools` and `item/tool/call` | Session-local Pi registration and GUI call relay | No native Pi configuration file is modified. |
 | Codex websocket transport | Deferred | Explicit deterministic rejection path is implemented. |
 | Legacy `codex/event/*` compatibility | Not implemented as a public surface | The current implementation targets the typed app-server surface instead. |
 | Remote deployment flow | Supported only through the CLI listener transport | There is no separate remote orchestration layer in codapter. |
@@ -148,4 +167,4 @@ The implementation is usable for routed Pi/Codex thread operations, turns, and s
 1. Worktree RPCs are still unsupported.
 2. Codex websocket transport is deferred.
 3. Remote tunnel orchestration is still external to codapter.
-4. Desktop plugin tools are not exposed to Pi through a dynamic-tool bridge.
+4. Remote plugin installation and complete desktop MCP management remain unsupported.

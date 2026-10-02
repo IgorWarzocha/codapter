@@ -2,7 +2,10 @@ import { randomUUID } from "node:crypto";
 import { mkdir, readFile, rename, rm, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { dirname, resolve } from "node:path";
-import type { GitInfo, SessionSource } from "./protocol.js";
+import type { ConfigObject } from "./config-toml.js";
+import { threadBrowserOverrides } from "./desktop-browser-policy.js";
+import type { DynamicToolSpec, GitInfo, SessionSource } from "./protocol.js";
+import { normalizeDisabledPluginIds, normalizeDynamicTools } from "./thread-desktop.js";
 
 type StoredSessionSource = Exclude<SessionSource, "appServer"> | { type: "appServer" };
 
@@ -32,6 +35,10 @@ export interface ThreadRegistryEntry {
   readonly agentNickname: string | null;
   readonly agentRole: string | null;
   readonly gitInfo: GitInfo | null;
+  readonly dynamicTools?: readonly DynamicToolSpec[];
+  readonly disabledPluginIds?: readonly string[];
+  /** Thread-only policy; null means original overrides are unknown. */
+  readonly browserOverrides?: ConfigObject | null;
 }
 
 export interface CreateThreadRegistryEntry {
@@ -54,6 +61,9 @@ export interface CreateThreadRegistryEntry {
   readonly agentNickname?: string | null;
   readonly agentRole?: string | null;
   readonly gitInfo?: GitInfo | null;
+  readonly dynamicTools?: readonly DynamicToolSpec[];
+  readonly disabledPluginIds?: readonly string[];
+  readonly browserOverrides?: ConfigObject | null;
 }
 
 export interface UpdateThreadRegistryEntry {
@@ -74,6 +84,9 @@ export interface UpdateThreadRegistryEntry {
   readonly agentNickname?: string | null;
   readonly agentRole?: string | null;
   readonly gitInfo?: GitInfo | null;
+  readonly dynamicTools?: readonly DynamicToolSpec[];
+  readonly disabledPluginIds?: readonly string[];
+  readonly browserOverrides?: ConfigObject | null;
 }
 
 interface ThreadRegistryFile {
@@ -228,8 +241,30 @@ export class ThreadRegistry {
         continue;
       }
       const rawSource = (entry as { source?: unknown }).source;
+      let dynamicTools: DynamicToolSpec[];
+      let disabledPluginIds: string[];
+      let browserOverrides: ConfigObject | null | undefined;
+      try {
+        dynamicTools = normalizeDynamicTools(entry.dynamicTools);
+        disabledPluginIds = normalizeDisabledPluginIds(entry.disabledPluginIds);
+        browserOverrides =
+          entry.backendType === "pi"
+            ? entry.browserOverrides == null
+              ? null
+              : threadBrowserOverrides(entry.browserOverrides)
+            : undefined;
+      } catch (error) {
+        this.logger.warn("Skipping thread with invalid desktop metadata", {
+          threadId: entry.threadId,
+          error: error instanceof Error ? error.message : String(error),
+        });
+        continue;
+      }
       this.entries.set(entry.threadId, {
         ...entry,
+        dynamicTools,
+        disabledPluginIds,
+        browserOverrides,
         ephemeral: entry.ephemeral ?? false,
         hidden: entry.hidden ?? false,
         path: entry.path ?? null,
@@ -303,6 +338,14 @@ export class ThreadRegistry {
       agentNickname: input.agentNickname ?? null,
       agentRole: input.agentRole ?? null,
       gitInfo: input.gitInfo ?? null,
+      dynamicTools: normalizeDynamicTools(input.dynamicTools),
+      disabledPluginIds: normalizeDisabledPluginIds(input.disabledPluginIds),
+      browserOverrides:
+        input.backendType === "pi"
+          ? input.browserOverrides == null
+            ? null
+            : threadBrowserOverrides(input.browserOverrides)
+          : undefined,
     };
 
     this.entries.set(entry.threadId, entry);
@@ -321,6 +364,18 @@ export class ThreadRegistry {
     const updated: ThreadRegistryEntry = {
       ...current,
       ...patch,
+      dynamicTools: normalizeDynamicTools(patch.dynamicTools ?? current.dynamicTools),
+      disabledPluginIds: normalizeDisabledPluginIds(
+        patch.disabledPluginIds ?? current.disabledPluginIds
+      ),
+      browserOverrides:
+        (patch.backendType ?? current.backendType) === "pi"
+          ? patch.browserOverrides === undefined
+            ? current.browserOverrides
+            : patch.browserOverrides === null
+              ? null
+              : threadBrowserOverrides(patch.browserOverrides)
+          : undefined,
       threadId,
       updatedAt: patch.updatedAt ?? new Date().toISOString(),
     };

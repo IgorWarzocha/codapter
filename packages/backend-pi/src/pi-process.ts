@@ -3,7 +3,9 @@ import type {
   BackendMessage,
   BackendSessionLaunchConfig,
   BackendTokenUsage,
+  DesktopSessionCapabilities,
 } from "@codapter/core";
+import { DesktopBridge } from "./desktop-bridge.js";
 import { normalizeElicitationResponse } from "./extension-ui.js";
 import { convertImages } from "./image-input.js";
 import { mapBackendMessages, mapTokenUsage } from "./message-mapping.js";
@@ -27,6 +29,8 @@ export interface PiProcessLaunchOptions {
   readonly env?: NodeJS.ProcessEnv;
   readonly cwd?: string;
   readonly collabExtensionPath?: string | null;
+  readonly desktopExtensionPath?: string | null;
+  readonly desktopMcpProxyPath?: string | null;
   readonly launchConfig?: BackendSessionLaunchConfig;
   readonly requestTimeoutMs?: number;
 }
@@ -54,10 +58,13 @@ export class PiProcessSession {
   private readonly listeners = new Set<(event: PiProcessEvent) => void>();
   private readonly turnStream: PiTurnStream;
   private promptAbort: AbortController | null = null;
+  private preparedTurn: { turnId: string; abort: AbortController } | null = null;
   private currentSessionFile: string | undefined;
   private currentSessionName: string | undefined;
   private currentModelContextWindow: number | null = null;
   private readonly logWriter: PiLogWriter | null;
+  private readonly desktop: DesktopBridge | null;
+  private readonly processEnv: NodeJS.ProcessEnv;
   constructor(options: PiProcessLaunchOptions) {
     this.opaqueSessionId = options.opaqueSessionId;
     const command = options.command ?? "pi";
@@ -66,6 +73,7 @@ export class PiProcessSession {
       "--session-dir",
       options.sessionDir,
       ...(options.collabExtensionPath ? ["--extension", options.collabExtensionPath] : []),
+      ...(options.desktopExtensionPath ? ["--extension", options.desktopExtensionPath] : []),
     ];
     const env: NodeJS.ProcessEnv = {
       ...process.env,
@@ -84,6 +92,23 @@ export class PiProcessSession {
         : {}),
     };
     const cwd = options.cwd ?? process.cwd();
+    delete env.CODAPTER_DESKTOP_UDS;
+    delete env.CODAPTER_DESKTOP_MCP_PROXY;
+    if (options.desktopMcpProxyPath) env.CODAPTER_DESKTOP_MCP_PROXY = options.desktopMcpProxyPath;
+    this.processEnv = env;
+    this.desktop = options.desktopExtensionPath
+      ? new DesktopBridge(
+          options.launchConfig?.desktopCapabilities,
+          (call) =>
+            this.emit({
+              type: "desktop_tool_call",
+              ...call,
+            }),
+          (event) => this.turnStream.handleDesktopMcpEvent(event),
+          (message) => this.emit({ type: "extension_error", message }),
+          (request) => this.emit({ type: "desktop_mcp_elicitation_request", ...request })
+        )
+      : null;
     const logFilePath = env.CODAPTER_DEBUG_LOG_FILE;
     this.logWriter =
       typeof logFilePath === "string" && logFilePath.length > 0
@@ -98,10 +123,13 @@ export class PiProcessSession {
       (event) => this.emit(event),
       () => this.sendRequest<UpstreamSessionState>({ type: "get_state" }),
       (turnId) => {
+        this.desktop?.cancelTurn("Desktop turn completed", "Stop");
+        if (this.preparedTurn?.turnId === turnId) this.preparedTurn = null;
         this.promptAbort = null;
         this.emitTokenUsage(turnId);
       },
-      this.logWriter
+      this.logWriter,
+      () => this.desktop?.instrumentedMcpServers(Boolean(options.desktopMcpProxyPath)) ?? []
     );
     this.transport = new PiRpcTransport({
       command,
@@ -110,7 +138,11 @@ export class PiProcessSession {
       cwd,
       requestTimeoutMs,
       onEvent: (event) => this.turnStream.handleEvent(event),
-      onDisconnect: (error) => this.turnStream.disconnect(error),
+      onDisconnect: (error) => {
+        this.desktop?.cancelTurn(error.message);
+        this.turnStream.disconnect(error);
+        void this.desktop?.dispose();
+      },
       log: (kind, raw, pid) =>
         this.logWriter?.write({
           at: new Date().toISOString(),
@@ -184,6 +216,34 @@ export class PiProcessSession {
     return this.turnStream.isBusy;
   }
 
+  prepareDesktopTurn(
+    threadId: string,
+    turnId: string,
+    capabilities?: DesktopSessionCapabilities
+  ): void {
+    this.preparedTurn = { turnId, abort: new AbortController() };
+    if (capabilities) this.desktop?.refresh(capabilities);
+    this.desktop?.beginTurn(threadId, turnId);
+  }
+
+  resolveDesktopRequest(requestId: string, response: unknown): boolean {
+    return this.desktop?.resolve(requestId, response) ?? false;
+  }
+
+  hasPendingDesktopRequest(requestId: string): boolean {
+    return this.desktop?.hasPendingRequest(requestId) ?? false;
+  }
+
+  refreshDesktopCapabilities(capabilities: DesktopSessionCapabilities): void {
+    this.desktop?.refresh(capabilities);
+  }
+
+  cancelDesktopTurn(turnId: string, reason: string): void {
+    if (this.preparedTurn?.turnId !== turnId) return;
+    this.preparedTurn?.abort.abort(new Error(reason));
+    this.desktop?.cancelTurn(reason);
+  }
+
   async setThinkingLevel(effort: string): Promise<void> {
     const level = effort === "none" ? "off" : effort;
     if (!["off", "minimal", "low", "medium", "high", "xhigh", "max"].includes(level)) {
@@ -197,8 +257,12 @@ export class PiProcessSession {
     message: string,
     images?: readonly BackendImageInput[]
   ): Promise<void> {
+    const prepared = this.preparedTurn;
+    if (prepared && prepared.turnId !== turnId)
+      throw new Error("Pi turn was interrupted before prompting");
+    const abort = prepared?.abort ?? new AbortController();
+    abort.signal.throwIfAborted();
     this.turnStream.begin(turnId);
-    const abort = new AbortController();
     this.promptAbort = abort;
     try {
       await this.ensureStarted();
@@ -214,13 +278,18 @@ export class PiProcessSession {
         await this.turnStream.finishHandledPromptIfIdle(turnId);
       }
     } catch (error) {
-      this.turnStream.reset();
-      this.promptAbort = null;
+      if (this.preparedTurn === prepared) {
+        this.desktop?.cancelTurn("Desktop prompt failed");
+        this.turnStream.reset();
+        this.promptAbort = null;
+      }
       throw error;
     }
   }
 
   async abort(): Promise<void> {
+    this.desktop?.cancelTurn("Desktop turn interrupted");
+    this.preparedTurn?.abort.abort(new Error("Pi prompt was aborted"));
     this.promptAbort?.abort(new Error("Pi prompt was aborted"));
     await this.ensureStarted();
     await this.sendRequest({ type: "abort" });
@@ -303,6 +372,8 @@ export class PiProcessSession {
   }
 
   async dispose(): Promise<void> {
+    this.preparedTurn?.abort.abort(new Error("Pi session has been disposed"));
+    await this.desktop?.dispose();
     this.promptAbort?.abort(new Error("Pi session has been disposed"));
     await this.transport.dispose();
     this.turnStream.reset();
@@ -324,6 +395,7 @@ export class PiProcessSession {
   }
 
   private async ensureStarted(): Promise<void> {
+    if (this.desktop) this.processEnv.CODAPTER_DESKTOP_UDS = await this.desktop.start();
     await this.transport.start();
   }
 
@@ -390,6 +462,7 @@ export class PiProcessSession {
   private async sendRequest<T = unknown>(
     command: Record<string, unknown>
   ): Promise<PiProcessResponse<T>> {
+    await this.ensureStarted();
     return await this.transport.request<T>(command);
   }
 

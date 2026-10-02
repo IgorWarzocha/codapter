@@ -1,6 +1,7 @@
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, resolve } from "node:path";
+import { configKeyPath, parseConfigToml, stringifyConfigToml } from "./config-toml.js";
 import type {
   Config,
   ConfigBatchWriteParams,
@@ -65,10 +66,7 @@ function ensureContainer(root: { [key: string]: JsonValue | undefined }, key: st
 }
 
 function applyEdit(config: Config, edit: ConfigEdit | ConfigValueWriteParams): void {
-  const segments = edit.keyPath.split(".").filter(Boolean);
-  if (segments.length === 0) {
-    return;
-  }
+  const segments = configKeyPath(edit.keyPath);
 
   let cursor: { [key: string]: JsonValue | undefined } = config;
   for (const segment of segments.slice(0, -1)) {
@@ -85,62 +83,13 @@ function applyEdit(config: Config, edit: ConfigEdit | ConfigValueWriteParams): v
     if (isJsonObject(current) && isJsonObject(edit.value)) {
       cursor[finalSegment] = {
         ...current,
-        ...edit.value,
+        ...structuredClone(edit.value),
       };
       return;
     }
   }
 
-  cursor[finalSegment] = edit.value;
-}
-
-function setConfigValue(config: Config, keyPath: string, value: JsonValue): void {
-  applyEdit(config, {
-    keyPath,
-    value,
-    mergeStrategy: "replace",
-  });
-}
-
-function parseTomlScalar(raw: string): JsonValue | undefined {
-  const value = raw.trim();
-  if (!value) {
-    return undefined;
-  }
-
-  if (value.startsWith('"') && value.endsWith('"')) {
-    return value
-      .slice(1, -1)
-      .replace(/\\\\/g, "\\")
-      .replace(/\\"/g, '"')
-      .replace(/\\n/g, "\n")
-      .replace(/\\r/g, "\r")
-      .replace(/\\t/g, "\t");
-  }
-
-  if (value === "true") {
-    return true;
-  }
-  if (value === "false") {
-    return false;
-  }
-
-  if (/^-?\d+(\.\d+)?$/.test(value)) {
-    return Number(value);
-  }
-
-  if (value.startsWith("[") && value.endsWith("]")) {
-    const inner = value.slice(1, -1).trim();
-    if (!inner) {
-      return [];
-    }
-    return inner
-      .split(",")
-      .map((entry) => parseTomlScalar(entry))
-      .filter((entry): entry is JsonValue => entry !== undefined);
-  }
-
-  return undefined;
+  cursor[finalSegment] = structuredClone(edit.value);
 }
 
 function loadConfigFromDisk(filePath: string): Config {
@@ -149,77 +98,13 @@ function loadConfigFromDisk(filePath: string): Config {
     return config;
   }
 
-  const raw = readFileSync(filePath, "utf8");
-  for (const line of raw.split(/\r?\n/)) {
-    const trimmed = line.trim();
-    if (!trimmed || trimmed.startsWith("#")) {
-      continue;
-    }
-
-    const separator = trimmed.indexOf("=");
-    if (separator <= 0) {
-      continue;
-    }
-
-    const keyPath = trimmed.slice(0, separator).trim();
-    const value = parseTomlScalar(trimmed.slice(separator + 1));
-    if (!keyPath || value === undefined) {
-      continue;
-    }
-
-    setConfigValue(config, keyPath, value);
-  }
-
-  return config;
-}
-
-function escapeTomlString(value: string): string {
-  return value
-    .replace(/\\/g, "\\\\")
-    .replace(/"/g, '\\"')
-    .replace(/\n/g, "\\n")
-    .replace(/\r/g, "\\r")
-    .replace(/\t/g, "\\t");
-}
-
-function formatTomlValue(value: JsonValue): string | null {
-  if (value === null) {
-    return null;
-  }
-  if (typeof value === "string") {
-    return `"${escapeTomlString(value)}"`;
-  }
-  if (typeof value === "number" || typeof value === "boolean") {
-    return String(value);
-  }
-  if (Array.isArray(value)) {
-    const formatted = value
-      .map((entry) => formatTomlValue(entry))
-      .filter((entry): entry is string => entry !== null);
-    return `[${formatted.join(", ")}]`;
-  }
-  return null;
-}
-
-function collectTomlLines(value: JsonValue | undefined, keyPath = ""): string[] {
-  if (value === undefined || value === null) {
-    return [];
-  }
-
-  if (Array.isArray(value) || typeof value !== "object") {
-    const formatted = formatTomlValue(value);
-    return keyPath && formatted ? [`${keyPath} = ${formatted}`] : [];
-  }
-
-  return Object.entries(value).flatMap(([key, child]) =>
-    collectTomlLines(child, keyPath ? `${keyPath}.${key}` : key)
-  );
+  return Object.assign(config, parseConfigToml(readFileSync(filePath, "utf8")));
 }
 
 export class InMemoryConfigStore {
   private readonly filePath: string;
   private versionCounter = 1;
-  private readonly config: Config;
+  private config: Config;
 
   constructor(
     filePath = process.env.CODAPTER_CONFIG_FILE ??
@@ -250,19 +135,17 @@ export class InMemoryConfigStore {
   }
 
   writeValue(params: ConfigValueWriteParams): ConfigWriteResponse {
-    this.assertVersion(params.expectedVersion ?? null);
-    applyEdit(this.config, params);
-    this.persist();
-    this.versionCounter += 1;
-    return this.createWriteResponse("ok");
+    return this.writeBatch({ edits: [params], expectedVersion: params.expectedVersion });
   }
 
   writeBatch(params: ConfigBatchWriteParams): ConfigWriteResponse {
     this.assertVersion(params.expectedVersion ?? null);
+    const candidate = structuredClone(this.config);
     for (const edit of params.edits) {
-      applyEdit(this.config, edit);
+      applyEdit(candidate, edit);
     }
-    this.persist();
+    this.persist(candidate);
+    this.config = candidate;
     this.versionCounter += 1;
     return this.createWriteResponse("ok");
   }
@@ -286,10 +169,9 @@ export class InMemoryConfigStore {
     };
   }
 
-  private persist(): void {
+  private persist(config: Config): void {
+    const contents = stringifyConfigToml(config);
     mkdirSync(dirname(this.filePath), { recursive: true });
-    const lines = collectTomlLines(this.config);
-    const output = lines.length > 0 ? `${lines.join("\n")}\n` : "";
-    writeFileSync(this.filePath, output, "utf8");
+    writeFileSync(this.filePath, contents, { encoding: "utf8", mode: 0o600 });
   }
 }

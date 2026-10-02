@@ -1,5 +1,8 @@
 import { randomUUID } from "node:crypto";
 import type { BackendEvent } from "@codapter/core";
+import type { DesktopMcpCallEvent } from "./chatgpt-apps-relay.js";
+import type { DesktopMcpElicitationRequest, DesktopToolCall } from "./desktop-bridge.js";
+import { McpEventFilter } from "./mcp-event-filter.js";
 import { assistantMessageText } from "./message-mapping.js";
 import type { PiLogWriter } from "./process-log.js";
 
@@ -33,6 +36,9 @@ function isToolUseAssistantMessage(message: unknown): boolean {
 
 export type PiProcessEvent =
   | BackendEvent
+  | ({ readonly type: "desktop_tool_call" } & DesktopToolCall)
+  | ({ readonly type: "desktop_mcp_event" } & DesktopMcpCallEvent)
+  | ({ readonly type: "desktop_mcp_elicitation_request" } & DesktopMcpElicitationRequest)
   | { readonly type: "disconnect"; readonly message: string }
   | { readonly type: "extension_error"; readonly message: string };
 
@@ -40,14 +46,18 @@ export class PiTurnStream {
   private completion: { text?: string; error?: string } = {};
   private currentTurnId: string | null = null;
   private nativeRunStarted = false;
+  private readonly mcpEvents: McpEventFilter;
 
   constructor(
     private readonly opaqueSessionId: string,
     private readonly emit: (event: PiProcessEvent) => void,
     private readonly readState: () => Promise<{ data?: PiRunState }>,
     private readonly onSettled: (turnId: string) => void,
-    private readonly logWriter: PiLogWriter | null
-  ) {}
+    private readonly logWriter: PiLogWriter | null,
+    instrumentedMcpServers: () => readonly string[] = () => []
+  ) {
+    this.mcpEvents = new McpEventFilter(instrumentedMcpServers, emit);
+  }
 
   get isBusy(): boolean {
     return this.currentTurnId !== null;
@@ -61,12 +71,14 @@ export class PiTurnStream {
   }
 
   reset(): void {
+    this.mcpEvents.flush();
     this.currentTurnId = null;
     this.nativeRunStarted = false;
     this.completion = {};
   }
 
   disconnect(error: Error): void {
+    this.mcpEvents.flush();
     if (this.currentTurnId) {
       this.emit({
         sessionId: this.opaqueSessionId,
@@ -77,6 +89,11 @@ export class PiTurnStream {
     }
     this.reset();
     this.emit({ type: "disconnect", message: error.message });
+  }
+
+  handleDesktopMcpEvent(event: DesktopMcpCallEvent): void {
+    if (event.turnId === this.currentTurnId) this.mcpEvents.observeRaw(event);
+    this.emit({ type: "desktop_mcp_event", ...event });
   }
 
   handleEvent(event: Record<string, unknown>): void {
@@ -118,7 +135,7 @@ export class PiTurnStream {
         }
         return;
       case "tool_execution_start":
-        this.emit({
+        this.mcpEvents.handle({
           sessionId: this.opaqueSessionId,
           turnId: this.currentTurnId ?? "unknown",
           type: "tool_start",
@@ -128,7 +145,7 @@ export class PiTurnStream {
         });
         return;
       case "tool_execution_update":
-        this.emit({
+        this.mcpEvents.handle({
           sessionId: this.opaqueSessionId,
           turnId: this.currentTurnId ?? "unknown",
           type: "tool_update",
@@ -139,7 +156,7 @@ export class PiTurnStream {
         });
         return;
       case "tool_execution_end":
-        this.emit({
+        this.mcpEvents.handle({
           sessionId: this.opaqueSessionId,
           turnId: this.currentTurnId ?? "unknown",
           type: "tool_end",
@@ -272,6 +289,7 @@ export class PiTurnStream {
     this.nativeRunStarted = false;
 
     this.onSettled(turnId);
+    this.mcpEvents.flush();
     this.emit(
       this.completion.error
         ? { sessionId: this.opaqueSessionId, turnId, type: "error", message: this.completion.error }

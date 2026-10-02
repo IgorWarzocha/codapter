@@ -1,7 +1,7 @@
 import { fileURLToPath } from "node:url";
 import type { CodexBackendOptions } from "@codapter/backend-codex";
 import type { PiBackendOptions } from "@codapter/backend-pi";
-import { ADAPTER_VERSION } from "@codapter/core";
+import { ADAPTER_VERSION, configKeyPath } from "@codapter/core";
 
 const ANALYTICS_FLAG = "--analytics-default-enabled";
 
@@ -105,7 +105,9 @@ export function writeHelp(stdout: NodeJS.WritableStream): void {
   stdout.write("  --listen <url>                 Add a stdio, TCP WebSocket, or UDS listener\n");
   stdout.write("  --collab                       Enable collab sub-agent support\n");
   stdout.write("  --analytics-default-enabled    Accepted and ignored\n");
-  stdout.write("  -c, --config <key=value>        Forward native config to Codex, not Pi\n");
+  stdout.write(
+    "  -c, --config <key=value>        Native Codex config and Pi Desktop plugin overrides\n"
+  );
 }
 
 export function resolveCollabExtensionPath(env: NodeJS.ProcessEnv = process.env): string {
@@ -116,6 +118,13 @@ export function resolveCollabExtensionPath(env: NodeJS.ProcessEnv = process.env)
   const relativePath = import.meta.url.endsWith("/codapter.mjs")
     ? "./collab-extension.mjs"
     : "../../collab-extension/dist/index.js";
+  return fileURLToPath(new URL(relativePath, import.meta.url));
+}
+
+function resolveDesktopAssetPath(name: "desktop-extension" | "desktop-mcp-proxy"): string {
+  const relativePath = import.meta.url.endsWith("/codapter.mjs")
+    ? `./${name}.mjs`
+    : `../../backend-pi/dist/${name === "desktop-extension" ? "desktop-extension/index" : name}.js`;
   return fileURLToPath(new URL(relativePath, import.meta.url));
 }
 
@@ -153,6 +162,20 @@ interface CodexConfigOverride {
   readonly argument: string;
 }
 
+export function isDesktopConfigOverride(override: CodexConfigOverride): boolean {
+  return [
+    "plugins",
+    "marketplaces",
+    "mcp_servers",
+    "apps",
+    "features",
+    "skills",
+    "apps_mcp_product_sku",
+    "browser_use",
+    "application",
+  ].includes(configKeyPath(override.key)[0]);
+}
+
 export function extractCodexConfig(args: readonly string[]): {
   args: string[];
   overrides: CodexConfigOverride[];
@@ -177,13 +200,12 @@ export function extractCodexConfig(args: readonly string[]): {
     const separator = argument.indexOf("=");
     const key = separator < 0 ? "" : argument.slice(0, separator).trim();
     const value = argument.slice(separator + 1);
-    // Native plugin ids include '@'. Values are opaque native TOML/string syntax,
+    // Native plugin ids include '@' and may be quoted. Values are opaque native TOML/string syntax,
     // including arrays, inline tables, auth headers and URLs containing '='.
-    if (
-      !/^[A-Za-z0-9_@-]+(?:\.[A-Za-z0-9_@-]+)*$/.test(key) ||
-      !value.trim() ||
-      argument.includes("\0")
-    ) {
+    try {
+      configKeyPath(key);
+      if (!value.trim() || argument.includes("\0")) throw new Error("Invalid override");
+    } catch {
       // Never echo the input: an invalid override may contain credentials.
       throw new Error(
         "Invalid Codex config override. Expected <key>=<value> with a dotted key path."
@@ -207,6 +229,8 @@ export function parseBackendOptions(
     const idleTimeoutMs = parseIdleTimeout(env.CODAPTER_PI_IDLE_TIMEOUT_MS);
     const staticAvailableModelsPath = env.CODAPTER_PI_STATIC_MODELS_FILE?.trim();
     pi = {
+      desktopExtensionPath: resolveDesktopAssetPath("desktop-extension"),
+      desktopMcpProxyPath: resolveDesktopAssetPath("desktop-mcp-proxy"),
       ...(env.CODAPTER_PI_COMMAND ? { command: env.CODAPTER_PI_COMMAND } : {}),
       ...(args ? { args } : {}),
       ...(idleTimeoutMs !== undefined ? { idleTimeoutMs } : {}),

@@ -2,7 +2,7 @@ import { randomUUID } from "node:crypto";
 import type { AppServerLogger } from "./app-server.js";
 import type { BackendAppServerEvent, BackendResolveServerRequestInput } from "./backend.js";
 import type { BackendRouter } from "./backend-router.js";
-import type { JsonRpcEnvelope, JsonRpcResponse } from "./jsonrpc.js";
+import { isRecord, type JsonRpcEnvelope, type JsonRpcResponse } from "./jsonrpc.js";
 
 interface PendingBackendServerRequest {
   threadId: string;
@@ -39,7 +39,13 @@ export class BackendServerRequests {
       threadHandle,
       backendRequestId: event.requestId,
     });
-    await this.send({ id: requestId, method: event.method, params }).catch(() => {
+    // Dynamic tool arguments belong to the GUI tool, not the thread protocol.
+    // Restore the opaque payload after translation of the request envelope.
+    const requestParams =
+      event.method === "item/tool/call" && isRecord(params) && isRecord(event.params)
+        ? { ...params, arguments: event.params.arguments }
+        : params;
+    await this.send({ id: requestId, method: event.method, params: requestParams }).catch(() => {
       this.pendingBackendServerRequests.delete(requestId);
     });
   }

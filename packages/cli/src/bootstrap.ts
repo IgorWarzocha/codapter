@@ -1,8 +1,18 @@
+import { resolve } from "node:path";
 import { createCodexBackend } from "@codapter/backend-codex";
 import { createPiBackend } from "@codapter/backend-pi";
-import { ADAPTER_VERSION, BackendRouter, type IBackend, readStoredAuthState } from "@codapter/core";
+import {
+  ADAPTER_VERSION,
+  BackendRouter,
+  DesktopPluginCatalog,
+  type IBackend,
+  InMemoryConfigStore,
+  readStoredAuthState,
+  resolveCodexHome,
+} from "@codapter/core";
 import {
   extractCodexConfig,
+  isDesktopConfigOverride,
   parseBackendOptions,
   parseListenTargets,
   writeHelp,
@@ -76,9 +86,20 @@ export async function runCli(
     const parsed = parseListenTargets(commandArgs, env);
     // Validate all enabled backend config before starting any resources.
     const options = parseBackendOptions(env, parsed.collabEnabled, stderr, invocation.overrides);
-    if (options.pi && invocation.overrides.length > 0) {
+    const configStore = new InMemoryConfigStore(env.CODAPTER_CONFIG_FILE);
+    const desktopPlugins = new DesktopPluginCatalog({
+      codexHome: env.CODEX_HOME ? resolve(env.CODEX_HOME) : resolveCodexHome(),
+      configStore,
+      overrides: invocation.overrides
+        .filter(isDesktopConfigOverride)
+        .map(({ argument }) => argument),
+    });
+    const ignoredOverrides = invocation.overrides.filter(
+      (override) => !isDesktopConfigOverride(override)
+    );
+    if (options.pi && ignoredOverrides.length > 0) {
       stderr.write(
-        `[codapter] Ignoring Codex config overrides for Pi: ${[...new Set(invocation.overrides.map(({ key }) => key))].join(", ")}. Pi extensions remain authoritative.\n`
+        `[codapter] Ignoring Codex config overrides for Pi: ${[...new Set(ignoredOverrides.map(({ key }) => key))].join(", ")}. Pi extensions remain authoritative.\n`
       );
     }
     if (options.pi && !shutdown.signal.aborted) {
@@ -99,6 +120,8 @@ export async function runCli(
       const backendRouter = new BackendRouter(backends);
       const listenerOptions = {
         backendRouter,
+        configStore,
+        desktopPlugins,
         stdin,
         stdout,
         collabEnabled: parsed.collabEnabled,

@@ -1,4 +1,6 @@
+import { PassThrough } from "node:stream";
 import { describe, expect, it } from "vitest";
+import { extractCodexConfig, isDesktopConfigOverride, parseBackendOptions } from "../src/config.js";
 import { parseListenTargets, resolveCollabExtensionPath } from "../src/index.js";
 
 describe("parseListenTargets", () => {
@@ -74,5 +76,54 @@ describe("resolveCollabExtensionPath", () => {
 
   it("falls back to the repo-built extension path", () => {
     expect(resolveCollabExtensionPath({})).toContain("/packages/collab-extension/dist/index.js");
+  });
+});
+
+describe("native config overrides", () => {
+  it("accepts quoted and legacy unquoted plugin ids, preserving raw TOML for Codex", () => {
+    const arguments_ = [
+      'plugins."browser.tools@bundled".enabled=true',
+      "plugins.browser@bundled.enabled=false",
+      "plugins.'code-review@bundled'.enabled=true",
+      'mcp_servers.local.http_headers={Authorization="Bearer token=private"}',
+      "model_reasoning_effort=low",
+      'browser_use.origins={"https://fixture.test"={access="deny"}}',
+      'application.network.domains=["fixture.test"]',
+    ];
+    const parsed = extractCodexConfig([
+      "-c",
+      arguments_[0],
+      "app-server",
+      ...arguments_.slice(1).flatMap((argument) => ["--config", argument]),
+    ]);
+    expect(parsed.args).toEqual(["app-server"]);
+    expect(parsed.overrides.map(({ argument }) => argument)).toEqual(arguments_);
+    expect(parsed.overrides.map(isDesktopConfigOverride)).toEqual([
+      true,
+      true,
+      true,
+      true,
+      false,
+      true,
+      true,
+    ]);
+    expect(parseBackendOptions({}, false, new PassThrough(), parsed.overrides).codex?.args).toEqual(
+      [...arguments_.flatMap((argument) => ["-c", argument]), "app-server"]
+    );
+  });
+
+  it("resolves source-run desktop assets from compiled backend siblings, independently of collab", () => {
+    const options = parseBackendOptions({}, false, new PassThrough());
+    expect(options.pi).toEqual({
+      desktopExtensionPath: expect.stringMatching(
+        /\/packages\/backend-pi\/dist\/desktop-extension\/index\.js$/
+      ),
+      desktopMcpProxyPath: expect.stringMatching(
+        /\/packages\/backend-pi\/dist\/desktop-mcp-proxy\.js$/
+      ),
+    });
+    expect(
+      parseBackendOptions({ CODAPTER_PI_DISABLE: "1" }, true, new PassThrough()).pi
+    ).toBeNull();
   });
 });

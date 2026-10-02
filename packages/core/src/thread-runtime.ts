@@ -5,6 +5,7 @@ import type { BackendRouter } from "./backend-router.js";
 import type { BackendServerRequests } from "./backend-server-requests.js";
 import type { BackendThreadMirror } from "./backend-thread-mirror.js";
 import type { Thread, ThreadStatus, Turn } from "./protocol.js";
+import { ThreadMcpEvents } from "./thread-mcp.js";
 import { serializeThread } from "./thread-protocol.js";
 import type { ThreadRegistryEntry } from "./thread-registry.js";
 
@@ -48,6 +49,7 @@ export class ThreadRuntime {
   private readyPromise: Promise<void> | null = null;
   private backend: string;
   private handle: string;
+  private readonly mcp = new ThreadMcpEvents();
   constructor(private readonly options: ThreadRuntimeOptions) {
     this.backend = options.backendType;
     this.handle = options.threadHandle;
@@ -76,7 +78,7 @@ export class ThreadRuntime {
     return this.phase === "ready" ? { type: "idle" } : { type: "active", activeFlags: [] };
   }
   buildThread(entry: ThreadRegistryEntry, turns: Turn[]): Thread {
-    return serializeThread(entry, this.threadStatus, turns);
+    return serializeThread(entry, this.threadStatus, this.mcp.mergeTurns(turns));
   }
   updateHandle(backendType: string, threadHandle: string): void {
     this.backend = backendType;
@@ -84,6 +86,7 @@ export class ThreadRuntime {
   }
   prepareResume(): void {
     this.eventLifetime += 1;
+    this.mcp.clear();
     const from = this.phase;
     this.phase = "starting";
     this.turnId = null;
@@ -126,6 +129,7 @@ export class ThreadRuntime {
   }
   terminate(): void {
     this.eventLifetime += 1;
+    this.mcp.clear();
     this.stopAcceptingEvents();
   }
   private stopAcceptingEvents(): void {
@@ -141,6 +145,7 @@ export class ThreadRuntime {
     this.stopAcceptingEvents();
     await this.drain();
     this.eventLifetime += 1;
+    this.mcp.clear();
   }
   async drain(): Promise<void> {
     await this.eventQueue.catch(() => {});
@@ -173,6 +178,7 @@ export class ThreadRuntime {
   }
   async finishTurn(turnId: string): Promise<void> {
     if (this.phase === "terminating" || this.turnId !== turnId) return;
+    this.mcp.finishTurn(turnId);
     this.turnId = null;
     this.phase = "ready";
     await this.publishStatus();
@@ -222,6 +228,27 @@ export class ThreadRuntime {
 
     switch (event.kind) {
       case "notification": {
+        if (event.method === "desktop/mcp/event") {
+          const normalized = this.mcp.accept(event.params, {
+            threadId,
+            threadHandle: this.threadHandle,
+            turnId: this.activeTurnId,
+          });
+          const at = Date.now();
+          await this.options.publish(
+            normalized.method,
+            {
+              threadId,
+              turnId: normalized.turnId,
+              item: normalized.item,
+              ...(normalized.method === "item/started"
+                ? { startedAtMs: at }
+                : { completedAtMs: at }),
+            },
+            threadId
+          );
+          return;
+        }
         if (event.method === "thread/started") {
           const updatedThread = await this.options.mirror.syncCanonicalThreadStarted(
             threadId,
@@ -244,7 +271,7 @@ export class ThreadRuntime {
           event.params
         );
         if (lifetime !== this.eventLifetime) return;
-        await this.options.publish(event.method, params, threadId);
+        await this.options.publish(event.method, this.mcp.mergeNotification(params), threadId);
         if (lifetime !== this.eventLifetime || this.phase === "terminating") return;
         if (event.method === "turn/started" && turnId) {
           const previousTurnId = this.activeTurnId;

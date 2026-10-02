@@ -1,3 +1,4 @@
 - Inspect installed Pi's RPC docs and the target release's source before changing the bridge. `turn-stream.ts` owns native run association: only `agent_settled` ends automatic work; a `handled` prompt needs an idle-state check because extensions can start separate work.
 - Keep thread reservation, serialized app-server events and dialog pairing in `thread-controller.ts`. Session activation, probe ownership and idle disposal belong to `session-runtime.ts`; detach before replacement and reconnect only after activation. Do not move native run state into either owner.
 - Keep native extension-dialog translation bidirectional. Codex questions/answers are not Pi UI request/response records.
+- MCP calls need their real GUI turn metadata and permission responses. Keep raw application arguments, results, and `_meta` opaque. Browser authentication goes through native Pi's provider API over the private bridge, never credential files or a Codex inference process.

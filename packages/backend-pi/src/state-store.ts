@@ -1,8 +1,10 @@
 import { randomUUID } from "node:crypto";
 import { mkdir, readFile, rename, writeFile } from "node:fs/promises";
 import { dirname, join } from "node:path";
+import type { DesktopSessionCapabilities } from "@codapter/core";
 
 export interface PiBackendSessionRecord {
+  readonly desktopCapabilities?: Pick<DesktopSessionCapabilities, "tools" | "instructions">;
   readonly opaqueSessionId: string;
   readonly sessionFile: string;
   readonly sessionName: string | null;

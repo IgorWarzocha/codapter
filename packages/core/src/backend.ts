@@ -1,5 +1,7 @@
+import type { DesktopSessionCapabilities } from "./desktop-capabilities.js";
 import type { JsonRpcId } from "./jsonrpc.js";
 import type {
+  DynamicToolSpec,
   JsonValue,
   ModelAccessPrograms,
   ModelServiceTier,
@@ -13,6 +15,7 @@ export interface Disposable {
 }
 
 export interface BackendSessionLaunchConfig {
+  readonly desktopCapabilities?: DesktopSessionCapabilities;
   readonly cwd?: string | null;
   readonly threadId?: string | null;
   readonly collabSocketPath?: string | null;
@@ -87,6 +90,7 @@ export interface ParsedBackendSelection {
 }
 
 export interface BackendThreadStartInput {
+  readonly dynamicTools?: readonly DynamicToolSpec[] | null;
   readonly threadId: string;
   readonly cwd: string;
   readonly model: string | null;
@@ -270,6 +274,8 @@ export type BackendEvent =
   | BackendTokenUsageTurnEvent;
 
 export interface BackendTurnStartInput {
+  readonly desktopCapabilities?: DesktopSessionCapabilities;
+  readonly disabledPluginIds?: readonly string[];
   readonly threadId: string;
   readonly threadHandle: string;
   readonly turnId: string;

@@ -161,6 +161,7 @@ export class CodexBackend implements IBackend {
       developerInstructions: input.developerInstructions ?? null,
       personality: input.personality ?? null,
       ephemeral: input.ephemeral ?? null,
+      dynamicTools: input.dynamicTools,
       experimentalRawEvents: input.experimentalRawEvents ?? false,
       persistExtendedHistory: input.persistExtendedHistory ?? false,
     })) as { thread?: { id?: string; path?: string | null }; reasoningEffort?: string | null };
@@ -297,6 +298,7 @@ export class CodexBackend implements IBackend {
       personality: input.personality ?? null,
       outputSchema: input.outputSchema ?? null,
       collaborationMode: input.collaborationMode ?? null,
+      disabledPluginIds: input.disabledPluginIds ?? null,
     })) as { turn?: { id?: string | null } };
     return {
       accepted: true,

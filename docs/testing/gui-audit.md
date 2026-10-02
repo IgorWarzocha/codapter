@@ -6,7 +6,7 @@ Use these checks to distinguish adapter failures from model choices and desktop-
 
 `npm run check` builds the distribution, checks lint, and runs deterministic protocol and lifecycle tests. The subprocess fixtures are controlled test doubles, not proof of installed-provider compatibility.
 
-`npm run test:live` runs the built CLI against installed Pi, using **Luna 6 with low reasoning**. It reads a fresh token through a native execution tool, checks turn completion, forks, and resumes after a process restart. The test isolates adapter storage while preserving HOME, Pi authentication, wrappers, extensions, and prompts.
+`npm run test:live` runs the built CLI against installed Pi, using **Luna 6 with low reasoning**. It reads fresh tokens through native execution and a GUI-supplied tool, checks turn completion, forks, and resumes after a process restart. The tests isolate adapter storage while preserving HOME, Pi authentication, wrappers, extensions, and prompts.
 
 For an explicit release check, the live test honors `CODAPTER_PI_COMMAND` and `CODAPTER_PI_ARGS`, then pins Luna 6 and low reasoning. Preserve any wrapper-specific loading flags when selecting another installed release. Do not disable extensions to make it pass.
 
@@ -46,8 +46,18 @@ DevTools lists targets at `http://127.0.0.1:9233/json/list`. Inspect the main `a
 | Fork | A new thread preserves history without changing the original. Pi cloning covers the active branch, not an arbitrary desktop message anchor |
 | Interrupt | Interrupt a running tool turn. Pi stops and the thread accepts a subsequent turn |
 | File changes | In a disposable workspace, change one line and compare the real file with the rendered change item. Code-mode tools may report nested effects differently from direct Pi edit tools |
+| GUI-provided tool | A fresh token known only to the client returns through `item/tool/call`, with matching GUI thread and turn IDs, before and after cold resume |
+| ChatGPT app | Use only a read-only profile lookup. Verify an actual `codex_apps` MCP result, not catalog discovery or a substituted native extension |
+| Browser plugin | Open an owned local page through the installed Browser plugin and read a random token absent from the prompt. Preserve policy checks and answer only the permission request for that page |
+| Tool exposure | Capture actual provider payloads for equivalent first turns with desktop capabilities enabled and disabled. Check standing instructions and schemas, not only source definitions |
 
 The 2026-10-01 compatibility checks used Pi 0.99.2 and the published Pi 1.0.0 package, native Codex CLI 0.159.3, and ChatGPT Desktop 26.928.31416 on Linux. Pi 1.0.0 ran from an isolated installation with the normal HOME and native extensions; the global Pi installation and model defaults were unchanged. Both built-CLI live runs passed on Luna 6 low, including execution, fork, and process restart. The Pi 1.0 desktop check verified native execution, both `pi-ask` dialogs and their returned values, the installed `/marker` command, and cold conversation reopening with paginated history. Native Codex model discovery passed without inference.
+
+The 2026-10-02 desktop-capability check used the same Desktop version and published Pi 1.0.0 with native extensions enabled. In the actual GUI, Pi successfully called `codex_apps` tool `google_drive.get_profile` using its existing ChatGPT sign-in. No messages or documents were read. A built-CLI live check also returned fresh GUI-owned tokens before and after cold resume.
+
+The Browser check reached a real desktop permission card for an owned local page. Selecting **Allow once** returned the GUI's `accept` response to the packaged Browser host. A subsequent Luna 6 low turn opened a fresh tab and read a newly generated page token absent from the prompt and prior history. Native MCP items retained Browser metadata, and the final answer matched the token. The process tree contained the packaged sandbox but no native Codex app-server. One earlier retry used Medium after the restored desktop picker reset, which is why provider-payload verification remains part of the procedure.
+
+An equivalent first-turn comparison on Luna 6 low produced identical serialized tool schemas at 4,788 characters. Enabling the installed desktop capabilities added 4,612 instruction characters: nine plugin skill discovery entries and Pi's native MCP discovery block. The app tool catalog remained deferred rather than entering every model request. These are measurements of that installed configuration, not fixed product costs.
 
 Custom terminal UI, themes, widgets, and keybindings are not representable in Pi RPC. Do not treat their absence as an adapter regression or claim that GUI skills/plugin inventories manage Pi extensions.
 
